@@ -1,0 +1,57 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bookrag
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"   # host 5433 → container 5432 (avoids conflict with local Postgres)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d bookrag"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      - "11434:11434"
+    # Uncomment for GPU support:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    environment:
+      - POSTGRES_URL=postgresql+psycopg://postgres:postgres@db:5432/bookrag
+      - ASYNC_POSTGRES_URL=postgresql+asyncpg://postgres:postgres@db:5432/bookrag
+      - OLLAMA_HOST=http://ollama:11434
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8000:8000"
+    command: ["python", "-m", "bookrag.worker"]
+
+volumes:
+  pgdata:
+  ollama_models:

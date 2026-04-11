@@ -1,0 +1,75 @@
+[project]
+name = "bookrag"
+version = "0.1.0"
+description = "Open-source book ingestion and Q&A system powered by local LLMs"
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+
+dependencies = [
+    # PDF extraction
+    "pdfplumber>=0.11",
+    "easyocr>=1.7",
+    "Pillow>=10.0",
+    # EPUB extraction
+    "ebooklib>=0.18",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.0",
+    # Tokenization & chunking
+    "tiktoken>=0.7",
+    # Embeddings
+    "sentence-transformers>=3.1",
+    "torch>=2.1",
+    "einops>=0.8",
+    # Database
+    "psycopg[binary,pool]>=3.1",
+    "pgvector>=0.3",
+    "sqlalchemy[asyncio]>=2.0",
+    "alembic>=1.13",
+    "asyncpg>=0.29",
+    # LLM (Ollama client for Gemma 4)
+    "ollama>=0.3",
+    # CLI
+    "typer>=0.12",
+    "rich>=13.7",
+    # Config
+    "pydantic-settings>=2.3",
+    "python-dotenv>=1.0",
+    # Fuzzy matching for query router
+    "rapidfuzz>=3.9",
+    # Utilities
+    "httpx>=0.27",
+    "tenacity>=8.3",
+    "aiofiles>=23.2",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+bookrag = "bookrag.cli.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bookrag"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
