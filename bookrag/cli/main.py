@@ -23,6 +23,7 @@ from typing import Optional
 from dotenv import load_dotenv
 load_dotenv()
 
+from sqlalchemy import text
 import typer
 from rich import print as rprint
 from rich.console import Console
@@ -61,6 +62,12 @@ def _get_db():
   """Return a sync DB session."""
   from bookrag.db.session import sync_session
   return sync_session()
+
+
+def _reset_db_pool():
+  """Dispose the connection pool to clear any stale idle-in-transaction connections."""
+  from bookrag.db.session import get_sync_engine
+  get_sync_engine().dispose()
 
 
 # ── setup ─────────────────────────────────────────────────────────────────────
@@ -165,6 +172,17 @@ def add(
                                help="Re-ingest even if book already exists"),
 ):
   """Ingest a PDF or EPUB book into BookRAG."""
+  if local:
+    import logging
+    import sys
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+    logging.root.setLevel(logging.INFO)
+    logging.root.handlers = [handler]
+
   if not file.exists():
     rprint(f"[red]File not found:[/red] {file}")
     raise typer.Exit(1)
@@ -180,61 +198,110 @@ def add(
   # Compute file hash
   sha256 = hashlib.sha256(file.read_bytes()).hexdigest()
 
-  with _get_db() as db:
-    from bookrag.config import get_settings
-    cfg = get_settings()
+  import sys, traceback as _tb
+  _reset_db_pool()  # clear any stale idle-in-transaction connections from previous runs
+  try:
+    with _get_db() as db:
+      from bookrag.config import get_settings
+      cfg = get_settings()
 
-    # Check book limit
-    count = db.query(Book).count()
-    if count >= cfg.max_books:
-      rprint(
-          f"[red]Book limit reached:[/red] maximum {cfg.max_books} books allowed.")
-      raise typer.Exit(1)
-
-    # Check for duplicate
-    existing = db.query(Book).filter(Book.file_hash == sha256).first()
-    if existing:
-      if existing.status == "failed" or force:
-        rprint(f"[yellow]Re-ingesting '[bold]{existing.title}[/bold]'…[/yellow]")
-        db.delete(existing)
-        db.flush()
+      existing = db.query(Book).filter(Book.file_hash == sha256).first()
+      if existing:
+        # Treat any incomplete/interrupted status as re-ingestable without --force.
+        # "completed" is the only status that means the ingestion finished successfully.
+        _INCOMPLETE = {"pending", "processing", "extracting", "chunking",
+                       "embedding", "summarising", "indexing", "failed"}
+        should_reingest = force or existing.status in _INCOMPLETE
+        if should_reingest:
+          if existing.status == "completed":
+            rprint(f"[yellow]Re-ingesting '[bold]{existing.title}[/bold]' (--force)…[/yellow]")
+          else:
+            rprint(f"[yellow]Re-ingesting '[bold]{existing.title}[/bold]' "
+                   f"(previous run was interrupted at status='{existing.status}')…[/yellow]")
+          from bookrag.db.models import ChapterSummary, ChildChunk, ParentChunk, Chapter, IngestionJob, Message, Session as DBSession
+          book_id = existing.id
+          # Fail fast if the worker holds a lock on this book's rows instead of hanging.
+          db.execute(text("SET LOCAL lock_timeout = '8s'"))
+          # Expunge from identity map so ORM doesn't try to cascade on top of bulk deletes
+          db.expunge(existing)
+          # Delete only sessions scoped to this specific book; messages cascade per session.
+          stale_sessions = (
+              db.query(DBSession)
+              .filter(DBSession.book_scope.like(f'%"{book_id}"%'))
+              .all()
+          )
+          for s in stale_sessions:
+              db.query(Message).filter(Message.session_id == s.id).delete(synchronize_session=False)
+              db.delete(s)
+          try:
+            db.query(ChapterSummary).filter(ChapterSummary.book_id == book_id).delete(synchronize_session=False)
+            db.query(ChildChunk).filter(ChildChunk.book_id == book_id).delete(synchronize_session=False)
+            db.query(ParentChunk).filter(ParentChunk.book_id == book_id).delete(synchronize_session=False)
+            db.query(Chapter).filter(Chapter.book_id == book_id).delete(synchronize_session=False)
+            db.query(IngestionJob).filter(IngestionJob.book_id == book_id).delete(synchronize_session=False)
+            db.query(Book).filter(Book.id == book_id).delete(synchronize_session=False)
+            db.flush()
+          except Exception as exc:
+            if "lock_timeout" in str(exc).lower() or "LockNotAvailable" in type(exc).__name__:
+              rprint("[red]✗ Cannot delete old data:[/red] the worker is still processing this book.")
+              rprint("[dim]Wait for the worker to finish (or stop it), then re-run with --force.[/dim]")
+              raise typer.Exit(1)
+            raise
+          if _SESSION_FILE.exists():
+            _SESSION_FILE.unlink()
+        else:
+          rprint(f"[yellow]Book already ingested:[/yellow] '{existing.title}' (id: {existing.id[:8]}…)")
+          rprint("[dim]Use --force to re-ingest.[/dim]")
+          raise typer.Exit(0)
       else:
-        rprint(
-            f"[yellow]Book already ingested:[/yellow] '{existing.title}' (id: {existing.id[:8]}…)")
-        rprint("[dim]Use --force to re-ingest.[/dim]")
-        raise typer.Exit(0)
+        count = db.query(Book).count()
+        if count >= cfg.max_books:
+          rprint(f"[red]Book limit reached:[/red] maximum {cfg.max_books} books allowed.")
+          raise typer.Exit(1)
 
-    # Extract metadata from file if not overridden
-    detected_title = title or _detect_title(file) or file.stem
-    detected_author = author or _detect_author(file)
+      print("DEBUG: detecting metadata...", flush=True)
+      detected_title = title or _detect_title(file) or file.stem
+      detected_author = author or _detect_author(file)
+      print(f"DEBUG: title={detected_title}", flush=True)
 
-    # Copy the file into ./data/books/ so the Docker worker can always reach it
-    import shutil
-    from bookrag.config import get_settings
-    data_books_dir = Path(get_settings().data_books_dir)
-    data_books_dir.mkdir(parents=True, exist_ok=True)
-    dest = data_books_dir / f"{sha256[:16]}{suffix}"
-    if not dest.exists():
-      shutil.copy2(file, dest)
+      import shutil
+      data_books_dir = Path(cfg.data_books_dir)
+      data_books_dir.mkdir(parents=True, exist_ok=True)
+      dest = data_books_dir / f"{sha256[:16]}{suffix}"
+      if not dest.exists():
+        shutil.copy2(file, dest)
+      print(f"DEBUG: file at {dest}", flush=True)
 
-    # Create book + job
-    book = Book(
-        title=detected_title,
-        author=detected_author,
-        file_path=str(dest),
-        file_hash=sha256,
-        file_type=suffix.lstrip("."),
-        status="pending",
-    )
-    db.add(book)
-    db.flush()
+      book = Book(
+          title=detected_title,
+          author=detected_author,
+          file_path=str(dest),
+          file_hash=sha256,
+          file_type=suffix.lstrip("."),
+          status="pending",
+      )
+      db.add(book)
+      print("DEBUG: flushing book...", flush=True)
+      db.flush()
+      print(f"DEBUG: book created id={book.id}", flush=True)
 
-    job = IngestionJob(book_id=book.id)
-    db.add(job)
-    db.flush()
+      # When running locally, claim the job immediately so the Docker worker
+      # doesn't race to pick it up between commit and process_job() starting.
+      job = IngestionJob(book_id=book.id, status="processing" if local else "queued")
+      db.add(job)
+      db.flush()
+      print(f"DEBUG: job created id={job.id}", flush=True)
 
-    book_id = book.id
-    job_id = job.id
+      book_id = book.id
+      job_id = job.id
+
+  except BaseException as exc:
+    print(f"\nERROR: {type(exc).__name__}: {exc}", file=sys.stdout, flush=True)
+    _tb.print_exc(file=sys.stdout)
+    sys.stdout.flush()
+    if isinstance(exc, typer.Exit):
+      raise
+    raise typer.Exit(1)
 
   if local:
     rprint(f"[green]✓[/green] Ingesting [bold]{detected_title}[/bold] locally…")
@@ -254,7 +321,20 @@ def add(
 def _run_ingestion_local(job_id: str) -> None:
   """Run the full ingestion pipeline in the current process (no Docker worker needed)."""
   from bookrag.ingestion.worker import process_job
-  process_job(job_id)
+  try:
+      process_job(job_id)
+  except Exception as exc:
+      rprint(f"[red]✗ Ingestion failed:[/red] {exc}")
+      raise typer.Exit(1)
+
+  # Check DB to confirm success (process_job swallows exceptions internally)
+  from bookrag.db.models import IngestionJob
+  with _get_db() as db:
+      job = db.query(IngestionJob).filter(IngestionJob.id == job_id).one()
+      if job.status == "failed":
+          rprint(f"[red]✗ Ingestion failed:[/red] {job.error_msg}")
+          raise typer.Exit(1)
+
   rprint("[green]✓[/green] Ingestion complete.")
 
 

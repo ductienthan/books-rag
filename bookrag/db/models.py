@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from pgvector.sqlalchemy import Vector
@@ -31,7 +31,7 @@ def _uuid() -> str:
 
 
 def _now() -> datetime:
-    return datetime.utcnow()
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class Base(DeclarativeBase):
@@ -102,6 +102,12 @@ class Chapter(Base):
     page_start: Mapped[Optional[int]] = mapped_column(Integer)
     page_end: Mapped[Optional[int]] = mapped_column(Integer)
     raw_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # Classification set at extraction time: "content" | "front_matter" |
+    # "back_matter" | "unknown".  Used by the worker to gate LLM summary calls
+    # and by retrieval to exclude non-content chapters from search results.
+    chapter_type: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="unknown"
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, nullable=False)
 
     book: Mapped[Book] = relationship("Book", back_populates="chapters")

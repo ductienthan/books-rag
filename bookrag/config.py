@@ -29,6 +29,13 @@ class Settings(BaseSettings):
   data_books_dir: str = "./data/books"
   ocr_char_threshold: int = 100
   max_books: int = 50
+  # Chapters (content type) with fewer chars than this are merged forward into
+  # the next chapter during the post-extraction consolidation pass.
+  min_chapter_chars: int = 400
+  # When True, only the shallowest TOC level is used as chapter boundaries.
+  # This prevents sub-sections from becoming separate chapters in books whose
+  # PDF outline nests chapters under parts.
+  toc_top_level_only: bool = True
 
   # ── Chunking ──────────────────────────────────────────────────────────────
   child_chunk_min_tokens: int = 80

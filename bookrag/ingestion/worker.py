@@ -2,15 +2,14 @@
 Layer 1 — Background ingestion worker.
 
 Polls ingestion_jobs for queued jobs and processes them in order.
-Each phase writes progress checkpoints so the job can resume after a crash.
+Each phase commits its own transaction so locks are released between phases,
+allowing concurrent re-ingest requests to proceed without hanging.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -32,7 +31,7 @@ _settings = get_settings()
 POLL_INTERVAL = 5   # seconds between polls when idle
 
 
-# ── Job phases ────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _update_job(db: Session, job: IngestionJob, **kwargs) -> None:
     for k, v in kwargs.items():
@@ -40,14 +39,40 @@ def _update_job(db: Session, job: IngestionJob, **kwargs) -> None:
     db.flush()
 
 
+def _load(db: Session, job_id: str) -> tuple[IngestionJob, Book]:
+    """Re-load job and book from DB — used at the start of each phase session."""
+    job = db.query(IngestionJob).filter(IngestionJob.id == job_id).one()
+    book = db.query(Book).filter(Book.id == job.book_id).one()
+    return job, book
+
+
+# ── Job phases ────────────────────────────────────────────────────────────────
+
 def _phase_extract(db: Session, job: IngestionJob, book: Book) -> list:
-    """Extract and persist chapters. Returns list of Chapter ORM objects."""
+    """Extract and persist chapters. Returns list of (Chapter, RawChapter) pairs."""
+    # Lock the book row for the duration of this transaction.  Without this,
+    # a concurrent `bookrag add --force` or `bookrag remove` can DELETE the
+    # book while extract() is running (PDF parsing takes minutes, during which
+    # the book row is only SELECTed — not locked).  The subsequent chapter
+    # INSERT then fails with a FK violation because the book no longer exists.
+    # The CLI already handles lock-timeout gracefully when --force is used.
+    book = db.query(Book).filter(Book.id == book.id).with_for_update().one()
     _update_job(db, job, status="extracting")
     log.info("[job %s] Extracting %s", job.id[:8], book.file_path)
 
     raw_chapters = extract(Path(book.file_path))
-    book.total_pages = max((c.page_end or 0) for c in raw_chapters if c.page_end) or None
+    book.total_pages = max((c.page_end for c in raw_chapters if c.page_end), default=None)
     book.total_chapters = len(raw_chapters)
+    db.flush()
+
+    # Delete any data already inserted for this book (idempotent retry).
+    # Use 'fetch' so SQLAlchemy loads and marks deleted objects in the identity
+    # map — prevents the ORM from re-flushing stale objects and causing
+    # UniqueViolation on retry.
+    db.query(ChapterSummary).filter(ChapterSummary.book_id == book.id).delete(synchronize_session="fetch")
+    db.query(ChildChunk).filter(ChildChunk.book_id == book.id).delete(synchronize_session="fetch")
+    db.query(ParentChunk).filter(ParentChunk.book_id == book.id).delete(synchronize_session="fetch")
+    db.query(Chapter).filter(Chapter.book_id == book.id).delete(synchronize_session="fetch")
     db.flush()
 
     chapter_objs = []
@@ -59,6 +84,7 @@ def _phase_extract(db: Session, job: IngestionJob, book: Book) -> list:
             page_start=raw.page_start,
             page_end=raw.page_end,
             raw_text=raw.raw_text,
+            chapter_type=raw.chapter_type.value,   # "content" | "front_matter" | …
         )
         db.add(ch)
         chapter_objs.append((ch, raw))
@@ -71,6 +97,7 @@ def _phase_extract(db: Session, job: IngestionJob, book: Book) -> list:
 def _phase_chunk(db: Session, job: IngestionJob, book: Book, chapter_pairs: list) -> int:
     """Chunk all chapters and persist parent + child chunks. Returns total child count."""
     _update_job(db, job, status="chunking")
+    log.info("[job %s] Chunking %d chapters", job.id[:8], len(chapter_pairs))
     total_children = 0
 
     for ch_obj, raw_ch in chapter_pairs:
@@ -113,123 +140,172 @@ def _phase_chunk(db: Session, job: IngestionJob, book: Book, chapter_pairs: list
     return total_children
 
 
-def _phase_embed(db: Session, job: IngestionJob, book: Book) -> None:
+def _phase_embed(job_id: str) -> None:
     """
     Embed all un-embedded child chunks in batches.
+    Each batch commits independently so locks are released continuously.
     Resumable: only processes chunks where embedded_at IS NULL.
-    Updates progress every 50 chunks.
     """
-    _update_job(db, job, status="embedding")
     batch_size = _settings.embed_batch_size
     start_time = time.monotonic()
-    embedded_count = job.chunks_embedded or 0
+    embedded_count = 0
+
+    # Initialise count from DB in case we're resuming.
+    with sync_session() as db:
+        job, book = _load(db, job_id)
+        _update_job(db, job, status="embedding")
+        embedded_count = job.chunks_embedded or 0
+        book_id = book.id
+        chunks_total = job.chunks_total or 0
 
     while True:
-        # Fetch next batch of un-embedded chunks
-        chunks = (
-            db.query(ChildChunk)
-            .filter(ChildChunk.book_id == book.id, ChildChunk.embedded_at.is_(None))
-            .order_by(ChildChunk.created_at)
-            .limit(batch_size)
-            .all()
-        )
-        if not chunks:
+        # Short read session — don't hold it during the slow embed call.
+        with sync_session() as db:
+            rows = (
+                db.query(ChildChunk.id, ChildChunk.text)
+                .filter(ChildChunk.book_id == book_id, ChildChunk.embedded_at.is_(None))
+                .order_by(ChildChunk.created_at)
+                .limit(batch_size)
+                .all()
+            )
+        if not rows:
             break
 
-        texts = [c.text for c in chunks]
+        chunk_ids = [r.id for r in rows]
+        texts = [r.text for r in rows]
         vectors = embed_batch(texts, batch_size=batch_size)
 
-        now = datetime.utcnow()
-        for chunk, vec in zip(chunks, vectors):
-            chunk.embedding = vec
-            chunk.embedded_at = now
+        # Short write session — rows may have been deleted by a concurrent
+        # re-ingest; using synchronize_session=False avoids StaleDataError.
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        with sync_session() as db:
+            job, _ = _load(db, job_id)
+            for chunk_id, vec in zip(chunk_ids, vectors):
+                db.query(ChildChunk).filter(ChildChunk.id == chunk_id).update(
+                    {"embedding": vec, "embedded_at": now},
+                    synchronize_session=False,
+                )
 
-        db.flush()
-        embedded_count += len(chunks)
-
-        # Progress update every 50 chunks
-        if embedded_count % 50 == 0 or len(chunks) < batch_size:
+            embedded_count += len(chunk_ids)
             elapsed = time.monotonic() - start_time
             rate = embedded_count / elapsed if elapsed > 0 else 1
-            remaining = (job.chunks_total or 0) - embedded_count
-            eta = datetime.utcnow() + timedelta(seconds=remaining / rate) if rate > 0 else None
-            pct = int(100 * embedded_count / max(job.chunks_total or 1, 1))
+            remaining = chunks_total - embedded_count
+            eta = (
+                datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=remaining / rate)
+                if rate > 0 else None
+            )
+            pct = int(100 * embedded_count / max(chunks_total, 1))
             _update_job(
                 db, job,
                 chunks_embedded=embedded_count,
-                progress_pct=min(pct, 95),    # reserve last 5% for indexing
+                progress_pct=min(pct, 95),
                 estimated_finish=eta,
             )
+        # batch committed, locks released
+
+        if embedded_count % (batch_size * 10) == 0 or len(rows) < batch_size:
+            elapsed = time.monotonic() - start_time
+            rate = embedded_count / elapsed if elapsed > 0 else 1
             log.info("[job %s] Embedded %d/%d chunks (%.0f/s)",
-                     job.id[:8], embedded_count, job.chunks_total or 0, rate)
+                     job_id[:8], embedded_count, chunks_total, rate)
 
-    log.info("[job %s] Embedding complete: %d chunks", job.id[:8], embedded_count)
+    log.info("[job %s] Embedding complete: %d chunks", job_id[:8], embedded_count)
 
 
-def _phase_summarise(db: Session, job: IngestionJob, book: Book) -> None:
+def _phase_summarise(job_id: str) -> None:
     """
-    Generate chapter summaries using Gemma 4 via Ollama, then embed them.
-    Skips chapters that already have a summary.
+    Generate chapter summaries via Ollama, then embed them.
+    Each chapter commits independently. Skips chapters already summarised.
     """
     import ollama
+    import tiktoken
+    from bookrag.ingestion.embedder import embed_documents
 
-    _update_job(db, job, status="summarising")
-    chapters = db.query(Chapter).filter(Chapter.book_id == book.id).order_by(Chapter.chapter_index).all()
+    with sync_session() as db:
+        job, book = _load(db, job_id)
+        _update_job(db, job, status="summarising")
+        book_id = book.id
+        chapter_ids = [
+            ch.id for ch in
+            db.query(Chapter).filter(Chapter.book_id == book_id).order_by(Chapter.chapter_index).all()
+        ]
+
+    log.info("[job %s] Summarising %d chapters via Ollama", job_id[:8], len(chapter_ids))
     client = ollama.Client(host=_settings.ollama_host)
+    enc = tiktoken.get_encoding("cl100k_base")
 
-    for ch in chapters:
-        # Skip if already done
-        if db.query(ChapterSummary).filter(ChapterSummary.chapter_id == ch.id).first():
-            continue
+    for i, chapter_id in enumerate(chapter_ids):
+        with sync_session() as db:
+            job, _ = _load(db, job_id)
+            ch = db.query(Chapter).filter(Chapter.id == chapter_id).one()
 
-        # Truncate very long chapters to ~3000 tokens for the summary prompt
-        text_sample = ch.raw_text[:12000]   # ~3000 tokens ≈ 12000 chars
-        prompt = (
-            f"Summarise the following book chapter in 3–5 paragraphs (500–800 words). "
-            f"Focus on key ideas, arguments, and narrative.\n\n"
-            f"Chapter title: {ch.title or 'Untitled'}\n\n"
-            f"{text_sample}"
-        )
+            # Skip if already done
+            if db.query(ChapterSummary).filter(ChapterSummary.chapter_id == ch.id).first():
+                log.info("[job %s] Chapter %d/%d already summarised, skipping",
+                         job_id[:8], i + 1, len(chapter_ids))
+                continue
 
-        try:
-            response = client.generate(
-                model=_settings.ollama_llm_model,
-                prompt=prompt,
-                options={"num_predict": _settings.summary_max_tokens},
+            log.info("[job %s] Summarising chapter %d/%d: %s [%s]",
+                     job_id[:8], i + 1, len(chapter_ids),
+                     ch.title or "Untitled", ch.chapter_type)
+
+            raw = ch.raw_text.strip()
+
+            # Front- and back-matter chapters (title page, copyright, index, etc.)
+            # contain no meaningful content to summarise — store raw text directly
+            # so we avoid wasting an Ollama round-trip on them.
+            if ch.chapter_type in ("front_matter", "back_matter"):
+                log.info(
+                    "[job %s] Chapter %d is %s — skipping LLM summarisation",
+                    job_id[:8], i + 1, ch.chapter_type,
+                )
+                summary_text = raw or f"[{ch.title or 'Untitled'} — {ch.chapter_type}]"
+            elif len(raw) < 500:
+                log.info("[job %s] Chapter %d too short (%d chars) — storing raw text as summary",
+                         job_id[:8], i + 1, len(raw))
+                summary_text = raw or f"[{ch.title or 'Untitled'} — no text content]"
+            else:
+                text_sample = raw[:12000]
+                prompt = (
+                    f"Summarise the following book chapter in 3–5 paragraphs (500–800 words). "
+                    f"Focus on key ideas, arguments, and narrative.\n\n"
+                    f"Chapter title: {ch.title or 'Untitled'}\n\n"
+                    f"{text_sample}"
+                )
+                try:
+                    response = client.generate(
+                        model=_settings.ollama_llm_model,
+                        prompt=prompt,
+                        options={"num_predict": _settings.summary_max_tokens},
+                    )
+                    summary_text = response.response.strip()
+                except Exception as exc:
+                    log.warning("[job %s] Summary generation failed for chapter %d: %s",
+                                job_id[:8], i, exc)
+                    summary_text = raw[:2000]
+
+            token_count = len(enc.encode(summary_text))
+            embedding = embed_documents([summary_text])[0]
+
+            summary = ChapterSummary(
+                chapter_id=ch.id,
+                book_id=book_id,
+                summary_text=summary_text,
+                token_count=token_count,
+                embedding=embedding,
             )
-            summary_text = response.response.strip()
-        except Exception as exc:
-            log.warning("[job %s] Summary generation failed for chapter %d: %s", job.id[:8], ch.chapter_index, exc)
-            summary_text = ch.raw_text[:2000]   # fallback to raw excerpt
+            db.add(summary)
+        # chapter summary committed, locks released
 
-        from bookrag.ingestion.embedder import embed_documents
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-        token_count = len(enc.encode(summary_text))
-        embedding = embed_documents([summary_text])[0]
-
-        summary = ChapterSummary(
-            chapter_id=ch.id,
-            book_id=book.id,
-            summary_text=summary_text,
-            token_count=token_count,
-            embedding=embedding,
-        )
-        db.add(summary)
-        db.flush()
-
-    log.info("[job %s] Chapter summaries done", job.id[:8])
+    log.info("[job %s] Chapter summaries done", job_id[:8])
 
 
 def _phase_index(db: Session, job: IngestionJob) -> None:
     """
-    The HNSW index is already defined — pgvector updates it incrementally
-    as rows are inserted. This phase just runs VACUUM ANALYZE to keep
-    statistics fresh and marks the job complete.
+    Run VACUUM ANALYZE to keep statistics fresh, then mark the job complete.
     """
     _update_job(db, job, status="indexing", progress_pct=98)
 
-    # Run ANALYZE outside the transaction (needs autocommit) — SQLAlchemy 2.0 style
     try:
         from bookrag.db.session import get_sync_engine
         engine = get_sync_engine()
@@ -243,50 +319,116 @@ def _phase_index(db: Session, job: IngestionJob) -> None:
 # ── Main worker loop ──────────────────────────────────────────────────────────
 
 def process_job(job_id: str) -> None:
-    """Process a single ingestion job end-to-end."""
-    with sync_session() as db:
-        job = db.query(IngestionJob).filter(IngestionJob.id == job_id).one()
-        book = db.query(Book).filter(Book.id == job.book_id).one()
+    """
+    Process a single ingestion job end-to-end.
+    Each phase runs in its own transaction so database locks are released
+    between phases — re-ingest requests never block for more than seconds.
+    """
+    job_short = job_id[:8]
 
+    def _mark_failed(exc: Exception) -> None:
         try:
-            _update_job(db, job, status="extracting", started_at=datetime.utcnow())
+            with sync_session() as db:
+                job = db.query(IngestionJob).filter(IngestionJob.id == job_id).first()
+                if not job:
+                    return
+                book = db.query(Book).filter(Book.id == job.book_id).first()
+                job.status = "failed"
+                job.error_msg = str(exc)[:1000]
+                job.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                if book:
+                    book.status = "failed"
+        except Exception:
+            log.exception("[job %s] Failed to update job status after error", job_short)
+
+    try:
+        # Phase 0 — mark started
+        with sync_session() as db:
+            job, book = _load(db, job_id)
+            _update_job(db, job, status="extracting",
+                        started_at=datetime.now(timezone.utc).replace(tzinfo=None))
             book.status = "processing"
-            db.flush()
 
+        # Phase 1 — extract (PDF parse + chapter insert); expire_on_commit=False keeps
+        # chapter objects accessible after commit so _phase_chunk can read their .id
+        with sync_session() as db:
+            job, book = _load(db, job_id)
             chapter_pairs = _phase_extract(db, job, book)
+
+        # Phase 2 — chunk
+        with sync_session() as db:
+            job, book = _load(db, job_id)
             _phase_chunk(db, job, book, chapter_pairs)
-            _phase_embed(db, job, book)
-            _phase_summarise(db, job, book)
+
+        # Phase 3 — embed (commits per batch internally)
+        _phase_embed(job_id)
+
+        # Phase 4 — summarise (commits per chapter internally)
+        _phase_summarise(job_id)
+
+        # Phase 5 — index + mark done
+        with sync_session() as db:
+            job, book = _load(db, job_id)
             _phase_index(db, job)
-
-            _update_job(db, job, status="done", progress_pct=100, finished_at=datetime.utcnow())
+            _update_job(db, job, status="done", progress_pct=100,
+                        finished_at=datetime.now(timezone.utc).replace(tzinfo=None))
             book.status = "completed"
-            log.info("[job %s] Ingestion complete for book '%s'", job.id[:8], book.title)
+            log.info("[job %s] Ingestion complete for book '%s'", job_short, book.title)
 
-        except Exception as exc:
-            log.exception("[job %s] Ingestion failed: %s", job.id[:8], exc)
-            _update_job(db, job, status="failed", error_msg=str(exc), finished_at=datetime.utcnow())
-            book.status = "failed"
+    except Exception as exc:
+        log.exception("[job %s] Ingestion failed: %s", job_short, exc)
+        _mark_failed(exc)
+        raise
+
+
+def _recover_stale_jobs() -> None:
+    """
+    On startup, reset any jobs left in an in-progress state back to 'queued'.
+    These are jobs that were being processed when the worker last crashed or
+    was restarted. _phase_extract is idempotent (deletes + rebuilds), so
+    requeuing is always safe.
+    """
+    IN_PROGRESS = ("processing", "extracting", "chunking", "embedding", "summarising", "indexing")
+    with sync_session() as db:
+        stale = (
+            db.query(IngestionJob)
+            .filter(IngestionJob.status.in_(IN_PROGRESS))
+            .all()
+        )
+        if stale:
+            for job in stale:
+                log.warning("Recovering stale job %s (was '%s') → queued", job.id[:8], job.status)
+                job.status = "queued"
+                job.progress_pct = 0
+            log.info("Recovered %d stale job(s).", len(stale))
 
 
 def run_worker() -> None:
     """Continuously poll for queued jobs and process them."""
     log.info("BookRAG worker started. Polling every %ds.", POLL_INTERVAL)
+    _recover_stale_jobs()
     while True:
         try:
+            job_id = None
             with sync_session() as db:
                 job = (
                     db.query(IngestionJob)
                     .filter(IngestionJob.status == "queued")
                     .order_by(IngestionJob.id)
+                    .with_for_update(skip_locked=True)
                     .first()
                 )
                 if job:
-                    log.info("Picked up job %s", job.id[:8])
+                    job.status = "processing"
+                    db.flush()
                     job_id = job.id
+                    log.info("Claimed job %s", job_id[:8])
 
-            if job:
-                process_job(job_id)
+            if job_id:
+                try:
+                    process_job(job_id)
+                except Exception as exc:
+                    log.error("Job %s failed: %s — continuing to next job", job_id[:8], exc)
             else:
                 time.sleep(POLL_INTERVAL)
 

@@ -2,6 +2,7 @@ from logging.config import fileConfig
 from sqlalchemy import engine_from_config, pool
 from alembic import context
 
+from bookrag.config import get_settings
 from bookrag.db.models import Base
 
 config = context.config
@@ -9,6 +10,10 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
+
+# Always pull the DB URL from pydantic Settings (which reads .env),
+# so alembic.ini never needs to be edited when the URL changes.
+config.set_main_option("sqlalchemy.url", get_settings().postgres_url)
 
 
 def run_migrations_offline() -> None:
