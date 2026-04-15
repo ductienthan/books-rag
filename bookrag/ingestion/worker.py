@@ -23,7 +23,7 @@ from bookrag.db.models import (
 from bookrag.db.session import sync_session
 from bookrag.ingestion.chunker import chunk_chapter
 from bookrag.ingestion.embedder import embed_batch
-from bookrag.ingestion.extractor import extract
+from bookrag.ingestion.extractor import ChapterType, extract
 
 log = logging.getLogger(__name__)
 _settings = get_settings()
@@ -101,6 +101,15 @@ def _phase_chunk(db: Session, job: IngestionJob, book: Book, chapter_pairs: list
     total_children = 0
 
     for ch_obj, raw_ch in chapter_pairs:
+        # Front- and back-matter chapters (title page, copyright, index, etc.)
+        # contain no retrievable content — skip chunking and embedding entirely.
+        if raw_ch.chapter_type in (ChapterType.FRONT_MATTER, ChapterType.BACK_MATTER):
+            log.info(
+                "[job %s] Skipping chunking for %s chapter '%s'",
+                job.id[:8], raw_ch.chapter_type.value, raw_ch.title,
+            )
+            continue
+
         result = chunk_chapter(raw_ch)
 
         for parent_data in result.parents:

@@ -33,9 +33,10 @@ class Settings(BaseSettings):
   # the next chapter during the post-extraction consolidation pass.
   min_chapter_chars: int = 400
   # When True, only the shallowest TOC level is used as chapter boundaries.
-  # This prevents sub-sections from becoming separate chapters in books whose
-  # PDF outline nests chapters under parts.
-  toc_top_level_only: bool = True
+  # Keep False (default): the front/back matter consolidation already handles
+  # tiny stubs, and level filtering would collapse individual chapters into
+  # their parent Parts, producing enormous 50-100 page "chapters".
+  toc_top_level_only: bool = False
 
   # ── Chunking ──────────────────────────────────────────────────────────────
   child_chunk_min_tokens: int = 80
@@ -48,13 +49,18 @@ class Settings(BaseSettings):
   summary_max_tokens: int = 800
 
   # ── Retrieval ─────────────────────────────────────────────────────────────
-  retrieval_top_k: int = 20
+  # Reduced from 20 → 10: the cross-encoder reranker runs on every candidate,
+  # so halving the pool roughly halves reranking time with negligible quality loss.
+  retrieval_top_k: int = 10
   rerank_top_k: int = 5
   cosine_threshold: float = 0.35
 
   # ── Agent / LLM ───────────────────────────────────────────────────────────
   llm_max_tokens: int = 512
   session_memory_window: int = 6
+  # Grounding check adds a full Ollama round-trip (~10-20s) after generation.
+  # Disabled by default for speed; enable when answer faithfulness is critical.
+  enable_grounding_check: bool = False
 
   # ── Logging ───────────────────────────────────────────────────────────────
   log_level: str = "INFO"

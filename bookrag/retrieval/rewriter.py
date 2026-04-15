@@ -21,6 +21,17 @@ from bookrag.config import get_settings
 log = logging.getLogger(__name__)
 _settings = get_settings()
 
+# Pronouns and phrases that signal the question relies on prior context and
+# therefore benefits from query rewriting.  If none of these appear AND the
+# question is already a reasonable length, we skip the Ollama round-trip.
+_NEEDS_CONTEXT_RE = re.compile(
+    r"\b(it\b|its\b|they\b|them\b|their\b|this\b|these\b|those\b|"
+    r"the\s+(?:previous|above|topic|concept|technique|approach|method|"
+    r"idea|point|same|latter|former)|"
+    r"previously|earlier\b|the\s+last\b)\b",
+    re.IGNORECASE,
+)
+
 _REWRITE_PROMPT = """\
 You are a search query optimiser for a book Q&A system.
 
@@ -46,9 +57,18 @@ def rewrite_query(question: str, history: list[dict]) -> list[str]:
     """
     Rewrite a query using recent conversation context.
     Falls back to the original question on any error.
+
+    Short-circuits (skips the Ollama call) when:
+    - There is no conversation history to resolve, OR
+    - The question has ≥5 words AND contains no ambiguous pronouns / context
+      references (it, this, they, the previous …) — meaning it is already
+      self-contained and rewriting would add no value.
     """
-    if not history and len(question.split()) >= 5:
-        # Short-circuit: no history, question is already decent
+    if not history:
+        return [question]
+
+    # Self-contained question — no pronouns to resolve even with history
+    if len(question.split()) >= 5 and not _NEEDS_CONTEXT_RE.search(question):
         return [question]
 
     history_text = "\n".join(

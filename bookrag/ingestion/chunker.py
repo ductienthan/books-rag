@@ -93,6 +93,54 @@ def _split_sentences(text: str) -> list[str]:
     return [s.strip() for s in result if s.strip()]
 
 
+# ── Page boundary helpers ─────────────────────────────────────────────────────
+
+def _build_page_boundaries(pages: list) -> list[tuple[int, int, int]]:
+    """
+    Build a list of (char_start, char_end, page_number) triples that mirror
+    the character offsets produced by RawChapter.raw_text — i.e. pages whose
+    text is non-empty joined with '\\n\\n'.
+
+    Used to map a parent chunk's char_start/char_end back to a page range.
+    """
+    boundaries: list[tuple[int, int, int]] = []
+    offset = 0
+    sep = "\n\n"
+    first = True
+    for page in pages:
+        if not page.text.strip():
+            continue
+        if not first:
+            offset += len(sep)
+        text_len = len(page.text)
+        boundaries.append((offset, offset + text_len, page.page_number))
+        offset += text_len
+        first = False
+    return boundaries
+
+
+def _page_range_for_chars(
+    char_start: int,
+    char_end: int,
+    boundaries: list[tuple[int, int, int]],
+    fallback_start: int | None,
+    fallback_end: int | None,
+) -> tuple[int | None, int | None]:
+    """
+    Return the (first_page, last_page) that overlap with [char_start, char_end].
+    Falls back to the chapter-level page range when no boundary matches.
+    """
+    first_page: int | None = None
+    last_page:  int | None = None
+    for (ps, pe, pnum) in boundaries:
+        # Overlap condition: the page and the chunk share at least one character
+        if ps < char_end and pe > char_start:
+            if first_page is None:
+                first_page = pnum
+            last_page = pnum
+    return (first_page or fallback_start), (last_page or fallback_end)
+
+
 # ── Core chunking logic ───────────────────────────────────────────────────────
 
 def _make_child_chunks(text: str, char_offset: int) -> list[ChildChunkData]:
@@ -154,10 +202,19 @@ def _make_child_chunks(text: str, char_offset: int) -> list[ChildChunkData]:
     return chunks
 
 
-def _make_parent_chunks(text: str, page_start: int | None, page_end: int | None) -> list[ParentChunkData]:
+def _make_parent_chunks(
+    text: str,
+    page_start: int | None,
+    page_end: int | None,
+    page_boundaries: list[tuple[int, int, int]] | None = None,
+) -> list[ParentChunkData]:
     """
     Slide a window of 300–400 tokens with 40-token overlap over paragraphs.
     Each parent chunk is sub-divided into child chunks.
+
+    When page_boundaries is provided (built from the chapter's RawPage list),
+    each parent chunk receives its own precise page_start/page_end rather than
+    inheriting the whole chapter's range.
     """
     paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
     min_t = _settings.parent_chunk_min_tokens
@@ -173,15 +230,25 @@ def _make_parent_chunks(text: str, page_start: int | None, page_end: int | None)
     def _flush():
         nonlocal idx, char_offset
         chunk_text = "\n\n".join(window)
-        children = _make_child_chunks(chunk_text, char_offset)
+        cs = char_offset
+        ce = char_offset + len(chunk_text)
+
+        if page_boundaries:
+            cp_start, cp_end = _page_range_for_chars(
+                cs, ce, page_boundaries, page_start, page_end
+            )
+        else:
+            cp_start, cp_end = page_start, page_end
+
+        children = _make_child_chunks(chunk_text, cs)
         parents.append(ParentChunkData(
             chunk_index=idx,
             text=chunk_text,
             token_count=_count_tokens(chunk_text),
-            char_start=char_offset,
-            char_end=char_offset + len(chunk_text),
-            page_start=page_start,
-            page_end=page_end,
+            char_start=cs,
+            char_end=ce,
+            page_start=cp_start,
+            page_end=cp_end,
             children=children,
         ))
         char_offset += len(chunk_text)
@@ -217,9 +284,19 @@ def _make_parent_chunks(text: str, page_start: int | None, page_end: int | None)
 def chunk_chapter(chapter: RawChapter) -> ChunkResult:
     """
     Take a RawChapter and produce the full hierarchical chunk structure.
+
+    Builds a page boundary map from the chapter's RawPage list so that each
+    parent chunk gets its own precise page_start/page_end rather than the
+    chapter's full range.
     """
     text = chapter.raw_text
-    parents = _make_parent_chunks(text, chapter.page_start, chapter.page_end)
+    page_boundaries = _build_page_boundaries(chapter.pages)
+    parents = _make_parent_chunks(
+        text,
+        chapter.page_start,
+        chapter.page_end,
+        page_boundaries,
+    )
 
     return ChunkResult(
         chapter_index=chapter.chapter_index,

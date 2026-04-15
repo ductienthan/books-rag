@@ -61,7 +61,8 @@ def search(
         query_vec = embed_query(query)
 
         # pgvector cosine distance (1 - cosine_similarity) via <=>
-        # We want similarity, so 1 - distance
+        # We want similarity, so 1 - distance.
+        # Join to chapters to exclude front/back matter from search results.
         sql = text("""
             SELECT
                 cc.id            AS child_id,
@@ -71,9 +72,11 @@ def search(
                 cc.text          AS child_text,
                 1 - (cc.embedding <=> CAST(:vec AS vector)) AS score
             FROM child_chunks cc
+            JOIN chapters ch ON ch.id = cc.chapter_id
             WHERE
                 cc.book_id = ANY(:book_ids)
                 AND cc.embedding IS NOT NULL
+                AND ch.chapter_type NOT IN ('front_matter', 'back_matter')
             ORDER BY cc.embedding <=> CAST(:vec AS vector)
             LIMIT :k
         """)
@@ -129,13 +132,16 @@ def search_chapter_summaries(
 ) -> list[ChapterSummary]:
     """
     Search chapter summaries for 'what is this chapter about' style queries.
+    Front- and back-matter chapters are excluded.
     """
     query_vec = embed_query(query)
     sql = text("""
         SELECT cs.id, 1 - (cs.embedding <=> CAST(:vec AS vector)) AS score
         FROM chapter_summaries cs
+        JOIN chapters ch ON ch.id = cs.chapter_id
         WHERE cs.book_id = ANY(:book_ids)
           AND cs.embedding IS NOT NULL
+          AND ch.chapter_type NOT IN ('front_matter', 'back_matter')
         ORDER BY cs.embedding <=> CAST(:vec AS vector)
         LIMIT :k
     """)

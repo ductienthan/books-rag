@@ -219,9 +219,12 @@ def ask(
         low_confidence=low_confidence,
     )
 
-    # ── 7. Grounding check ────────────────────────────────────────────────────
+    # ── 7. Grounding check (optional) ────────────────────────────────────────
+    # Disabled by default (enable_grounding_check=False) because it adds a
+    # full Ollama round-trip (~10-20s) after generation.  Enable via .env or
+    # config when answer faithfulness verification is worth the latency cost.
     is_grounded = True
-    if top_chunks and not low_confidence:
+    if _settings.enable_grounding_check and top_chunks and not low_confidence:
         is_grounded = check_grounding(question, result.answer, top_chunks)
 
     # ── 8. Persist messages ───────────────────────────────────────────────────
