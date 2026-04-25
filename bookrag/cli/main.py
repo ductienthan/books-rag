@@ -2,14 +2,18 @@
 Layer 4 — CLI / TUI (typer + rich).
 
 Commands:
-  bookrag setup               First-time setup wizard
-  bookrag add <file>          Ingest a PDF or EPUB
-  bookrag list                List all ingested books
-  bookrag status [job_id]     Check ingestion job status
-  bookrag ask '<question>'    Ask a question (interactive or one-shot)
-  bookrag session new         Create a new session
-  bookrag session scope       Set book scope for current session
-  bookrag remove <book_id>    Remove a book and all its data
+  bookrag setup                    First-time setup wizard
+  bookrag add <file>               Ingest a PDF or EPUB
+  bookrag list                     List all ingested books
+  bookrag status [job_id]          Check ingestion job status
+  bookrag ask '<question>'         Ask a question (interactive or one-shot)
+  bookrag session new              Create a new session
+  bookrag session scope            Set book scope for current session
+  bookrag remove <book_id>         Remove a book and all its data
+  bookrag cache-stats              Display cache statistics
+  bookrag clear-cache              Clear query result cache
+  bookrag build-bm25-index         Build BM25 keyword search indexes
+  bookrag rebuild-bm25-index       Rebuild all BM25 indexes
 """
 from __future__ import annotations
 
@@ -535,9 +539,114 @@ def ask(
       set_session_scope(sid, book_id_list, db)
 
   if question:
-    _run_query(question, sid)
+    # Check if streaming is enabled
+    from bookrag.config import get_settings
+    settings = get_settings()
+    if settings.enable_streaming:
+      _run_query_stream(question, sid)
+    else:
+      _run_query(question, sid)
   else:
     _interactive_loop(sid)
+
+
+def _run_query_stream(question: str, session_id: str) -> None:
+  """Run query with streaming display (Phase 3.3)."""
+  import time
+  from rich.live import Live
+  from rich.spinner import Spinner
+  from rich.text import Text
+  from bookrag.agent.loop import ask_stream, StreamUpdate
+
+  start = time.monotonic()
+
+  # Variables to accumulate state
+  answer_parts = []
+  progress_messages = []
+  final_response = None
+
+  # Create initial display
+  progress_text = Text("", style="cyan")
+  answer_text = Text("", style="white")
+
+  with Live("", console=console, refresh_per_second=10) as live:
+    with _get_db() as db:
+      for update in ask_stream(question, session_id, db):
+        if update.type == "progress":
+          # Update progress message
+          progress_messages.append(update.data)
+          progress_text = Text(f"⏳ {update.data}", style="cyan")
+          live.update(progress_text)
+
+        elif update.type == "chunk":
+          # Append answer chunk and update display
+          answer_parts.append(update.data)
+          current_answer = "".join(answer_parts)
+
+          # Show progress + partial answer
+          display = Text()
+          display.append("✓ Generating answer...\n\n", style="green")
+          display.append(current_answer, style="white")
+          live.update(display)
+
+        elif update.type == "complete":
+          # Store final response
+          final_response = update.data
+
+  elapsed = time.monotonic() - start
+
+  if not final_response:
+    console.print("[red]Error: No response received[/red]")
+    return
+
+  # Now display final formatted output (same as non-streaming)
+  warning = "" if final_response.is_grounded else "\n⚠️  [dim]Low confidence — answer may not be fully supported by the books.[/dim]"
+  console.print(Panel(
+      Markdown(final_response.answer + warning),
+      title="[bold cyan]Answer[/bold cyan]",
+      border_style="cyan",
+  ))
+
+  # Text excerpts
+  if final_response.chunks:
+    console.print("\n[bold]Relevant Excerpts:[/bold]\n")
+    for i, chunk in enumerate(final_response.chunks[:3], 1):
+      excerpt = chunk.parent_text
+      if len(excerpt) > 400:
+        excerpt = excerpt[:400] + "..."
+
+      source_info = f"[dim]{chunk.book_title}"
+      if chunk.chapter_title:
+        source_info += f" • {chunk.chapter_title}"
+      if chunk.page_start:
+        if chunk.page_start == chunk.page_end:
+          source_info += f" • p. {chunk.page_start}"
+        else:
+          source_info += f" • pp. {chunk.page_start}–{chunk.page_end}"
+      source_info += "[/dim]"
+
+      console.print(Panel(
+          f"{excerpt}\n\n{source_info}",
+          title=f"[dim]Excerpt {i}[/dim]",
+          border_style="dim",
+          padding=(1, 2),
+      ))
+    console.print()
+
+  # Sources table
+  if final_response.sources:
+    table = Table(show_header=True, header_style="dim",
+                  box=None, padding=(0, 2))
+    table.add_column("Book", style="bold")
+    table.add_column("Chapter")
+    table.add_column("Pages")
+    table.add_column("Score", justify="right", style="dim")
+    for src in final_response.sources:
+      table.add_row(src["book"], src["chapter"],
+                    src["pages"], str(src["score"]))
+    console.print(table)
+
+  console.print(f"[dim]Answered in {elapsed:.1f}s[/dim]")
 
 
 def _run_query(question: str, session_id: str) -> None:
@@ -558,7 +667,36 @@ def _run_query(question: str, session_id: str) -> None:
       border_style="cyan",
   ))
 
-  # Sources
+  # Text excerpts from retrieved chunks
+  if response.chunks:
+    console.print("\n[bold]Relevant Excerpts:[/bold]\n")
+    # Display up to 3 excerpts
+    for i, chunk in enumerate(response.chunks[:3], 1):
+      # Truncate long text to 400 characters for display
+      excerpt = chunk.parent_text
+      if len(excerpt) > 400:
+        excerpt = excerpt[:400] + "..."
+
+      # Build source citation
+      source_info = f"[dim]{chunk.book_title}"
+      if chunk.chapter_title:
+        source_info += f" • {chunk.chapter_title}"
+      if chunk.page_start:
+        if chunk.page_start == chunk.page_end:
+          source_info += f" • p. {chunk.page_start}"
+        else:
+          source_info += f" • pp. {chunk.page_start}–{chunk.page_end}"
+      source_info += "[/dim]"
+
+      console.print(Panel(
+          f"{excerpt}\n\n{source_info}",
+          title=f"[dim]Excerpt {i}[/dim]",
+          border_style="dim",
+          padding=(1, 2),
+      ))
+    console.print()
+
+  # Sources table
   if response.sources:
     table = Table(show_header=True, header_style="dim",
                   box=None, padding=(0, 2))
@@ -671,6 +809,229 @@ def remove(
 
     db.delete(book)
     rprint(f"[green]✓[/green] Removed [bold]{book.title}[/bold].")
+
+
+# ── Phase 3: Cache Management ─────────────────────────────────────────────────
+
+@app.command(name="cache-stats")
+def cache_stats():
+  """Display cache statistics and performance metrics."""
+  from pathlib import Path
+  from bookrag.config import get_settings
+  from bookrag.retrieval.cache import CacheManager
+
+  settings = get_settings()
+  cache_mgr = CacheManager(
+      cache_dir=Path(settings.cache_dir),
+      answer_ttl=settings.answer_cache_ttl,
+      enable_embedding_cache=settings.enable_embedding_cache,
+      enable_answer_cache=settings.enable_answer_cache,
+  )
+
+  console.rule("[bold cyan]Cache Statistics[/bold cyan]")
+
+  stats = cache_mgr.stats()
+
+  # Overall stats table
+  table = Table(title="Cache Overview", show_header=True, header_style="bold cyan")
+  table.add_column("Metric", style="dim")
+  table.add_column("Value", justify="right")
+
+  if "embedding_cache" in stats:
+    table.add_row("Embedding Cache Entries", str(stats["embedding_cache"]["count"]))
+    table.add_row("Embedding Cache Size", f"{stats['embedding_cache']['size_mb']:.2f} MB")
+
+  if "answer_cache" in stats:
+    answer_stats = stats["answer_cache"]
+    table.add_row("Answer Cache Entries (Total)", str(answer_stats["total_entries"]))
+    table.add_row("Answer Cache Entries (Valid)", f"[green]{answer_stats['valid_entries']}[/green]")
+    table.add_row("Answer Cache Entries (Expired)", f"[yellow]{answer_stats['expired_entries']}[/yellow]")
+    table.add_row("Answer Cache Size", f"{answer_stats['size_mb']:.2f} MB")
+    table.add_row("Answer Cache TTL", f"{answer_stats['ttl_seconds']}s ({answer_stats['ttl_seconds']//60}min)")
+
+  table.add_row("──────────", "──────────")
+  table.add_row("[bold]Total Cache Size[/bold]", f"[bold]{stats['total_size_mb']:.2f} MB[/bold]")
+
+  console.print(table)
+
+  # Cache status
+  if "answer_cache" in stats and stats["answer_cache"]["expired_entries"] > 0:
+    console.print(
+        f"\n[yellow]💡 Tip:[/yellow] Run [bold]bookrag clear-cache --expired[/bold] "
+        f"to remove {stats['answer_cache']['expired_entries']} expired entries."
+    )
+
+  # Performance estimates
+  if "answer_cache" in stats and stats["answer_cache"]["valid_entries"] > 0:
+    avg_time_saved = 120  # seconds (average query time without cache)
+    total_hits_estimated = stats["answer_cache"]["valid_entries"] * 2  # assume 2 uses per cache entry
+    time_saved_total = avg_time_saved * total_hits_estimated / 60  # minutes
+
+    console.print(
+        f"\n[green]⚡ Performance:[/green] With {stats['answer_cache']['valid_entries']} "
+        f"cached answers, you've potentially saved ~{time_saved_total:.0f} minutes of wait time!"
+    )
+
+
+@app.command(name="clear-cache")
+def clear_cache(
+    expired_only: bool = typer.Option(
+        False, "--expired", "-e", help="Only clear expired cache entries"),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip confirmation"),
+):
+  """Clear the query result cache."""
+  from pathlib import Path
+  from bookrag.config import get_settings
+  from bookrag.retrieval.cache import CacheManager
+
+  settings = get_settings()
+  cache_mgr = CacheManager(
+      cache_dir=Path(settings.cache_dir),
+      answer_ttl=settings.answer_cache_ttl,
+      enable_embedding_cache=settings.enable_embedding_cache,
+      enable_answer_cache=settings.enable_answer_cache,
+  )
+
+  if expired_only:
+    # Clear only expired entries
+    count = cache_mgr.clear_expired()
+    rprint(f"[green]✓[/green] Cleared {count} expired cache entries.")
+    return
+
+  # Clear all caches
+  if not yes:
+    confirmed = Confirm.ask(
+        "[yellow]Warning:[/yellow] This will clear ALL cached answers and embeddings. Continue?")
+    if not confirmed:
+      rprint("[dim]Cancelled.[/dim]")
+      return
+
+  stats = cache_mgr.clear_all()
+  rprint(f"[green]✓[/green] Cache cleared:")
+  rprint(f"  • Embeddings: {stats['embeddings_cleared']} entries")
+  rprint(f"  • Answers: {stats['answers_cleared']} entries")
+  rprint("\n[dim]Next queries will rebuild the cache.[/dim]")
+
+
+# ── Phase 3: BM25 Index Management ────────────────────────────────────────────
+
+@app.command(name="build-bm25-index")
+def build_bm25_index(
+    book_id: Optional[str] = typer.Argument(
+        None, help="Build index for specific book ID (prefix). If omitted, builds for all books."),
+    force: bool = typer.Option(
+        False, "--force", "-f", help="Force rebuild even if index exists"),
+):
+  """Build BM25 keyword search indexes for ingested books."""
+  from pathlib import Path
+  from bookrag.config import get_settings
+  from bookrag.retrieval.bm25 import BM25IndexManager
+  from bookrag.db.models import Book
+
+  settings = get_settings()
+
+  if not settings.enable_bm25:
+    rprint("[yellow]⚠[/yellow]  BM25 is disabled in configuration (ENABLE_BM25=false).")
+    rprint("[dim]Tip: Set ENABLE_BM25=true in .env to enable BM25 hybrid search.[/dim]")
+    return
+
+  console.rule("[bold cyan]BM25 Index Builder[/bold cyan]")
+
+  with _get_db() as db:
+    # Get books to index
+    if book_id:
+      # Build for specific book
+      book = db.query(Book).filter(Book.id.like(f"{book_id}%")).first()
+      if not book:
+        rprint(f"[red]Book not found:[/red] {book_id}")
+        raise typer.Exit(1)
+      books = [book]
+    else:
+      # Build for all books
+      books = db.query(Book).all()
+
+    if not books:
+      rprint("[yellow]No books found to index.[/yellow]")
+      return
+
+    rprint(f"Building BM25 index for {len(books)} book(s)...\n")
+
+    index_dir = Path(settings.bm25_index_dir)
+    manager = BM25IndexManager(index_dir=index_dir)
+
+    # Build indexes
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console
+    ) as progress:
+      task = progress.add_task("[cyan]Building indexes...", total=len(books))
+
+      for book in books:
+        progress.update(task, description=f"[cyan]Building: {book.title[:40]}...")
+
+        try:
+          index = manager.build_index([book.id], db, force=force)
+          stats = index.stats()
+
+          rprint(f"  [green]✓[/green] {book.title[:50]}")
+          rprint(f"    [dim]└─ {stats['num_documents']} chunks, "
+                 f"{stats['total_tokens']} tokens indexed[/dim]")
+
+        except Exception as e:
+          rprint(f"  [red]✗[/red] {book.title[:50]}")
+          rprint(f"    [dim]└─ Error: {e}[/dim]")
+
+        progress.advance(task)
+
+    rprint(f"\n[green]✓[/green] BM25 index building complete!")
+    rprint(f"[dim]Indexes saved to: {index_dir}[/dim]")
+
+
+@app.command(name="rebuild-bm25-index")
+def rebuild_bm25_index(
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip confirmation"),
+):
+  """Rebuild ALL BM25 indexes (force rebuild)."""
+  from pathlib import Path
+  from bookrag.config import get_settings
+  from bookrag.retrieval.bm25 import BM25IndexManager
+
+  settings = get_settings()
+
+  if not settings.enable_bm25:
+    rprint("[yellow]⚠[/yellow]  BM25 is disabled in configuration (ENABLE_BM25=false).")
+    return
+
+  # Confirm
+  if not yes:
+    confirmed = Confirm.ask(
+        "[yellow]Warning:[/yellow] This will rebuild ALL BM25 indexes. Continue?")
+    if not confirmed:
+      rprint("[dim]Cancelled.[/dim]")
+      return
+
+  console.rule("[bold cyan]BM25 Index Rebuild[/bold cyan]")
+
+  with _get_db() as db:
+    index_dir = Path(settings.bm25_index_dir)
+    manager = BM25IndexManager(index_dir=index_dir)
+
+    rprint("Rebuilding all BM25 indexes...\n")
+
+    try:
+      count = manager.rebuild_all(db)
+      rprint(f"\n[green]✓[/green] Rebuilt {count} BM25 indexes successfully!")
+      rprint(f"[dim]Indexes saved to: {index_dir}[/dim]")
+
+    except Exception as e:
+      rprint(f"[red]Error:[/red] {e}")
+      raise typer.Exit(1)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
