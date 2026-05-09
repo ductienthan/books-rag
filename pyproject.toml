@@ -37,6 +37,9 @@ dependencies = [
     "python-dotenv>=1.0",
     # Fuzzy matching for query router
     "rapidfuzz>=3.9",
+    # HTTP API
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
     # Utilities
     "httpx>=0.27",
     "tenacity>=8.3",

@@ -18,6 +18,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Iterator
 
@@ -32,7 +33,7 @@ from bookrag.retrieval.cache import CacheManager
 from bookrag.retrieval.reranker import rerank
 from bookrag.retrieval.router import resolve_scope
 from bookrag.retrieval.rewriter import rewrite_query
-from bookrag.retrieval.searcher import RetrievedChunk, search, search_chapter_summaries, extract_page_numbers
+from bookrag.retrieval.searcher import RetrievedChunk, search, search_chapter_summaries, search_within_chapter, extract_page_numbers
 
 log = logging.getLogger(__name__)
 _settings = get_settings()
@@ -52,12 +53,16 @@ def _get_cache_manager() -> CacheManager:
         )
     return _cache_manager
 
-# Typo-tolerant: sum[ma]+r covers "summary", "sumary", "summry", etc.
-_SUMMARY_RE = re.compile(
-    r'\b(sum[ma]+r\w*|overview|outline|what.+cover|what.+about|describe)\b',
-    re.IGNORECASE,
-)
-_CHAPTER_RE = re.compile(r'\b(chapter|part|section)\b', re.IGNORECASE)
+# ── Query intent taxonomy ─────────────────────────────────────────────────────
+
+class QueryIntent(str, Enum):
+    CHAPTER_SUMMARY  = "chapter_summary"   # "Summarize chapter 3"
+    BOOK_SUMMARY     = "book_summary"      # "What is this book about?"
+    TOPIC_IN_CHAPTER = "topic_in_chapter"  # "Summarize motivation in chapter 5"
+    GENERAL          = "general"           # Everything else — default
+
+
+# ── Regex patterns ─────────────────────────────────────────────────────────────
 _CHAPTER_NUM_RE = re.compile(
     r'\b(?:chapter|part|section)\s+'
     r'(\d+|one|two|three|four|five|six|seven|eight|nine|ten|'
@@ -99,6 +104,110 @@ _FRONT_BACK_MATTER_RE = re.compile(
     r'index|bibliography|back\s+cover|colophon|permissions?)\s*$',
     re.IGNORECASE,
 )
+
+# ── Semantic intent classification (embedding-based) ──────────────────────────
+# Prototype sentences per intent — the model embeds these once and caches centroids.
+# Add more examples to shift the decision boundary for a specific intent.
+
+_INTENT_THRESHOLD = 0.55  # cosine similarity floor; below → GENERAL
+
+_INTENT_PROTOTYPES: dict[str, list[str]] = {
+    QueryIntent.CHAPTER_SUMMARY: [
+        "Summarize chapter 3",
+        "Give me an overview of chapter 5",
+        "What is chapter 2 about?",
+        "What happens in chapter one?",
+        "Outline chapter four for me",
+        "What does chapter 7 cover?",
+        "Can you summarize the second chapter?",
+    ],
+    QueryIntent.BOOK_SUMMARY: [
+        "What is this book about?",
+        "Summarize the entire book",
+        "Give me an overview of the book",
+        "What does this book cover?",
+        "What is the main topic of this book?",
+        "Provide a book summary",
+        "Describe the whole book for me",
+    ],
+    QueryIntent.TOPIC_IN_CHAPTER: [
+        "What does chapter 3 say about this topic?",
+        "Explain the main concept discussed in chapter 2",
+        "Find information about the key idea in chapter 4",
+        "What does chapter 6 cover regarding that subject?",
+        "Summarize the topic covered in chapter 5",
+        "What are the key points in chapter 7?",
+        "How is this concept explained in chapter 1?",
+    ],
+}
+
+_intent_centroids: dict[str, list[float]] | None = None
+
+
+def _get_intent_centroids() -> dict[str, list[float]]:
+    """Embed intent prototypes once and cache their centroid vectors (per process).
+
+    Uses embed_query() (search_query: prefix) for prototypes because they are
+    query sentences — the same prefix used at classification time.  Using
+    embed_documents() here would introduce an asymmetric prefix mismatch that
+    deflates cosine similarity scores and hurts classification accuracy.
+    """
+    global _intent_centroids
+    if _intent_centroids is None:
+        import numpy as np
+        from bookrag.ingestion.embedder import embed_query
+        _intent_centroids = {}
+        for intent_key, examples in _INTENT_PROTOTYPES.items():
+            vecs = np.array([embed_query(ex) for ex in examples])  # (N, 768) — query-space vectors
+            centroid = vecs.mean(axis=0)
+            centroid /= np.linalg.norm(centroid)                   # re-normalise after averaging
+            _intent_centroids[intent_key] = centroid.tolist()
+        log.info("Intent centroids cached for %d intents", len(_intent_centroids))
+    return _intent_centroids
+
+
+def classify_intent(question: str) -> tuple[QueryIntent, int | None]:
+    """
+    Route the question to the most semantically similar intent using
+    nomic-embed-text-v1.5 (already loaded by the search stack).
+
+    Returns (intent, chapter_num_or_None).
+    Chapter-specific intents fall back to GENERAL when no chapter number is found.
+    """
+    import numpy as np
+    from bookrag.ingestion.embedder import embed_query
+
+    chapter_num = _extract_chapter_number(question)   # existing helper
+    q_vec = np.array(embed_query(question))           # (768,) normalised
+
+    centroids = _get_intent_centroids()
+    best_key: str = QueryIntent.GENERAL
+    best_score: float = 0.0
+    all_scores: dict[str, float] = {}
+
+    for intent_key, centroid in centroids.items():
+        score = float(np.dot(q_vec, np.array(centroid)))
+        all_scores[intent_key] = round(score, 4)
+        if score > best_score:
+            best_score = score
+            best_key = intent_key
+
+    log.debug("Intent scores: %s — best: %s (%.4f), threshold: %.2f",
+              all_scores, best_key, best_score, _INTENT_THRESHOLD)
+
+    if best_score < _INTENT_THRESHOLD:
+        return QueryIntent.GENERAL, None
+
+    intent = QueryIntent(best_key)
+
+    # Chapter-specific intents require a chapter number — fall back if absent
+    if intent in (QueryIntent.CHAPTER_SUMMARY, QueryIntent.TOPIC_IN_CHAPTER):
+        if chapter_num is None:
+            log.debug("Intent %s requires chapter number but none found — GENERAL", intent)
+            return QueryIntent.GENERAL, None
+        return intent, chapter_num
+
+    return intent, None
 
 
 def _is_simple_query(question: str) -> bool:
@@ -151,10 +260,6 @@ def _needs_expanded_context(question: str) -> bool:
     return False
 
 
-def _is_chapter_summary_request(question: str) -> bool:
-    return bool(_SUMMARY_RE.search(question) and _CHAPTER_RE.search(question))
-
-
 def _extract_chapter_number(question: str) -> int | None:
     """Return the 1-based chapter number from the question, or None."""
     m = _CHAPTER_NUM_RE.search(question)
@@ -168,14 +273,14 @@ def _chapter_summaries_as_chunks(
     question: str,
     book_ids: list[str],
     db: DBSession,
+    chapter_num: int | None = None,
 ) -> list[RetrievedChunk]:
     """Fetch pre-generated chapter summaries and return them as RetrievedChunk objects.
 
-    When a specific chapter number is mentioned, does a direct DB lookup by
-    chapter_index (reliable). Otherwise falls back to semantic search.
+    When chapter_num is provided (preferred — already extracted by classify_intent),
+    does a direct DB lookup by chapter_index (reliable).
+    Otherwise falls back to semantic search over chapter summary embeddings.
     """
-    chapter_num = _extract_chapter_number(question)
-
     if chapter_num is not None:
         # Find the Nth real chapter, skipping front/back matter.
         # A chapter is "real" if its summary has enough content (not a cover/title page).
@@ -220,6 +325,85 @@ def _chapter_summaries_as_chunks(
             score=1.0,
         ))
     return chunks
+
+
+def _all_chapter_summaries_as_chunks(
+    book_ids: list[str],
+    db: DBSession,
+) -> list[RetrievedChunk]:
+    """Return ALL pre-generated chapter summaries ordered by book → chapter_index.
+
+    Used for BOOK_SUMMARY intent — passes the full chapter set to the LLM for synthesis.
+    Applies the same front/back-matter and minimum-length filters as
+    _chapter_summaries_as_chunks().
+    """
+    all_summaries = (
+        db.query(ChapterSummary)
+        .join(Chapter, ChapterSummary.chapter_id == Chapter.id)
+        .filter(
+            ChapterSummary.book_id.in_(book_ids),
+            Chapter.chapter_type == "content",
+        )
+        .order_by(ChapterSummary.book_id, Chapter.chapter_index)
+        .all()
+    )
+    real = [
+        cs for cs in all_summaries
+        if len(cs.chapter.raw_text.strip()) >= _MIN_CHAPTER_RAW_CHARS
+        and not (cs.chapter.title and _FRONT_BACK_MATTER_RE.match(cs.chapter.title))
+    ]
+    if not real:
+        return []
+    books_map = {b.id: b for b in db.query(Book).filter(Book.id.in_(book_ids)).all()}
+    return [
+        RetrievedChunk(
+            child_id=cs.id,
+            parent_id=cs.chapter_id,
+            book_id=cs.book_id,
+            book_title=books_map[cs.book_id].title,
+            chapter_index=cs.chapter.chapter_index,
+            chapter_title=cs.chapter.title,
+            page_start=cs.chapter.page_start,
+            page_end=cs.chapter.page_end,
+            child_text=cs.summary_text,
+            parent_text=cs.summary_text,
+            score=1.0,
+        )
+        for cs in real
+        if cs.book_id in books_map
+    ]
+
+
+def _chapter_scoped_chunks(
+    question: str,
+    chapter_num: int,
+    book_ids: list[str],
+    db: DBSession,
+    top_k: int,
+) -> list[RetrievedChunk]:
+    """Vector-search restricted to a specific chapter's child chunks.
+
+    Used for TOPIC_IN_CHAPTER intent — finds the chapter_id for chapter_num
+    (1-based, real chapters only) then delegates to search_within_chapter().
+    """
+    all_summaries = (
+        db.query(ChapterSummary)
+        .join(Chapter, ChapterSummary.chapter_id == Chapter.id)
+        .filter(ChapterSummary.book_id.in_(book_ids))
+        .order_by(Chapter.chapter_index)
+        .all()
+    )
+    real = [
+        cs for cs in all_summaries
+        if len(cs.chapter.raw_text.strip()) >= _MIN_CHAPTER_RAW_CHARS
+        and not (cs.chapter.title and _FRONT_BACK_MATTER_RE.match(cs.chapter.title))
+    ]
+    if not real or chapter_num > len(real):
+        log.warning("Chapter %d not found (total real chapters: %d)", chapter_num, len(real))
+        return []
+    target_chapter_id = real[chapter_num - 1].chapter_id
+    log.info("TOPIC_IN_CHAPTER: restricting search to chapter_id=%s", target_chapter_id)
+    return search_within_chapter([question], [target_chapter_id], book_ids, db, top_k=top_k)
 
 
 @dataclass
@@ -304,31 +488,65 @@ def ask(
             scope_type=scope.scope_type,
         )
 
-    # ── 2. Route: chapter summary vs. regular search ──────────────────────────
-    if _is_chapter_summary_request(question):
-        log.info("Detected chapter summary request — using pre-generated summaries")
-        top_chunks = _chapter_summaries_as_chunks(question, scope.book_ids, db)
-        if top_chunks:
-            log.info("Returning %d pre-generated chapter summaries directly", len(top_chunks))
-            # Return the pre-generated summary text directly — no LLM needed.
-            answer_parts = []
-            for c in top_chunks:
-                label = c.chapter_title or f"Chapter {c.chapter_index + 1}"
-                answer_parts.append(f"## {label}\n\n{c.parent_text}")
-            answer_text = "\n\n---\n\n".join(answer_parts)
-            book_ids_used = list({c.book_id for c in top_chunks})
-            chunk_ids_used = [c.child_id for c in top_chunks]
-            _persist(question, answer_text, session_id, db, book_ids_used, chunk_ids_used)
-            return AgentResponse(
-                answer=answer_text,
-                sources=_build_sources(top_chunks),
-                chunks=top_chunks,
-                session_id=session_id,
-                is_grounded=True,
-                scope_type=scope.scope_type,
-            )
-        log.info("No chapter summaries found — falling back to vector search")
+    # ── 2. Intent routing ─────────────────────────────────────────────────────
+    intent, chapter_num = classify_intent(question)
+    log.info("Intent: %s (chapter=%s)", intent, chapter_num)
 
+    if intent == QueryIntent.CHAPTER_SUMMARY:
+        log.info("Route → pre-generated chapter summary (no LLM)")
+        top_chunks = _chapter_summaries_as_chunks(question, scope.book_ids, db, chapter_num=chapter_num)
+        if top_chunks:
+            answer_text = "\n\n---\n\n".join(
+                f"## {c.chapter_title or f'Chapter {c.chapter_index + 1}'}\n\n{c.parent_text}"
+                for c in top_chunks
+            )
+            _persist(question, answer_text, session_id, db,
+                     list({c.book_id for c in top_chunks}), [c.child_id for c in top_chunks])
+            return AgentResponse(
+                answer=answer_text, sources=_build_sources(top_chunks), chunks=top_chunks,
+                session_id=session_id, is_grounded=True, scope_type=scope.scope_type,
+            )
+        log.info("No chapter summaries found — falling back to GENERAL")
+
+    elif intent == QueryIntent.BOOK_SUMMARY:
+        log.info("Route → book-level summary via LLM synthesis of all chapter summaries")
+        top_chunks = _all_chapter_summaries_as_chunks(scope.book_ids, db)
+        if top_chunks:
+            if len(top_chunks) > 10:
+                log.warning(
+                    "BOOK_SUMMARY: %d chapters exceed context budget — truncating to 10. "
+                    "Consider raising max_context_tokens for full coverage.",
+                    len(top_chunks),
+                )
+                top_chunks = top_chunks[:10]
+            result = generate_answer(question, top_chunks, history, low_confidence=False)
+            _persist(question, result.answer, session_id, db, result.book_ids, result.chunk_ids)
+            cache_mgr.set_answer(question, scope.book_ids, result.answer, top_chunks,
+                                 "book_summary", (time.time() - start_time) * 1000)
+            return AgentResponse(
+                answer=result.answer, sources=_build_sources(top_chunks), chunks=top_chunks,
+                session_id=session_id, is_grounded=True, scope_type=scope.scope_type,
+            )
+        log.info("No chapter summaries available — falling back to GENERAL")
+
+    elif intent == QueryIntent.TOPIC_IN_CHAPTER:
+        log.info("Route → topic-in-chapter vector search (chapter %d)", chapter_num)
+        top_chunks = _chapter_scoped_chunks(
+            question, chapter_num, scope.book_ids, db, top_k=_settings.retrieval_top_k
+        )
+        if top_chunks:
+            top_chunks = rerank(question, top_chunks, top_k=_settings.rerank_top_k)
+            result = generate_answer(question, top_chunks, history, low_confidence=False)
+            _persist(question, result.answer, session_id, db, result.book_ids, result.chunk_ids)
+            cache_mgr.set_answer(question, scope.book_ids, result.answer, top_chunks,
+                                 "topic_in_chapter", (time.time() - start_time) * 1000)
+            return AgentResponse(
+                answer=result.answer, sources=_build_sources(top_chunks), chunks=top_chunks,
+                session_id=session_id, is_grounded=True, scope_type=scope.scope_type,
+            )
+        log.info("No chapter-scoped results found — falling back to GENERAL")
+
+    # GENERAL (or any fallback): continue to query rewriting + vector search
     # ── 3. Rewrite queries (skip for simple queries to save time) ─────────────
     if _is_simple_query(question):
         log.info("Simple query detected — skipping LLM rewriting")
@@ -544,30 +762,81 @@ def ask_stream(
         yield StreamUpdate("complete", response)
         return
 
-    # ── 2. Route: chapter summary vs. regular search ──────────────────────────
-    if _is_chapter_summary_request(question):
-        yield StreamUpdate("progress", "Fetching chapter summaries...")
-        top_chunks = _chapter_summaries_as_chunks(question, scope.book_ids, db)
-        if top_chunks:
-            answer_parts = []
-            for c in top_chunks:
-                label = c.chapter_title or f"Chapter {c.chapter_index + 1}"
-                answer_parts.append(f"## {label}\n\n{c.parent_text}")
-            answer_text = "\n\n---\n\n".join(answer_parts)
-            book_ids_used = list({c.book_id for c in top_chunks})
-            chunk_ids_used = [c.child_id for c in top_chunks]
-            _persist(question, answer_text, session_id, db, book_ids_used, chunk_ids_used)
-            response = AgentResponse(
-                answer=answer_text,
-                sources=_build_sources(top_chunks),
-                chunks=top_chunks,
-                session_id=session_id,
-                is_grounded=True,
-                scope_type=scope.scope_type,
-            )
-            yield StreamUpdate("complete", response)
-            return
+    # ── 2. Intent routing ─────────────────────────────────────────────────────
+    yield StreamUpdate("progress", "Classifying intent...")
+    intent, chapter_num = classify_intent(question)
+    log.info("Intent: %s (chapter=%s)", intent, chapter_num)
 
+    if intent == QueryIntent.CHAPTER_SUMMARY:
+        yield StreamUpdate("progress", "Fetching chapter summary...")
+        top_chunks = _chapter_summaries_as_chunks(question, scope.book_ids, db, chapter_num=chapter_num)
+        if top_chunks:
+            answer_text = "\n\n---\n\n".join(
+                f"## {c.chapter_title or f'Chapter {c.chapter_index + 1}'}\n\n{c.parent_text}"
+                for c in top_chunks
+            )
+            _persist(question, answer_text, session_id, db,
+                     list({c.book_id for c in top_chunks}), [c.child_id for c in top_chunks])
+            yield StreamUpdate("complete", AgentResponse(
+                answer=answer_text, sources=_build_sources(top_chunks), chunks=top_chunks,
+                session_id=session_id, is_grounded=True, scope_type=scope.scope_type,
+            ))
+            return
+        log.info("No chapter summaries found — falling back to GENERAL")
+
+    elif intent == QueryIntent.BOOK_SUMMARY:
+        yield StreamUpdate("progress", "Synthesizing book overview...")
+        top_chunks = _all_chapter_summaries_as_chunks(scope.book_ids, db)
+        if top_chunks:
+            if len(top_chunks) > 10:
+                log.warning(
+                    "BOOK_SUMMARY: %d chapters exceed context budget — truncating to 10. "
+                    "Consider raising max_context_tokens for full coverage.",
+                    len(top_chunks),
+                )
+                top_chunks = top_chunks[:10]
+            answer_parts = []
+            for chunk in generate_answer_stream(question, top_chunks, history, low_confidence=False):
+                answer_parts.append(chunk)
+                yield StreamUpdate("chunk", chunk)
+            answer_text = "".join(answer_parts)
+            _persist(question, answer_text, session_id, db,
+                     list({c.book_id for c in top_chunks}), [c.child_id for c in top_chunks])
+            cache_mgr.set_answer(question, scope.book_ids, answer_text, top_chunks,
+                                 "book_summary", (time.time() - start_time) * 1000)
+            yield StreamUpdate("complete", AgentResponse(
+                answer=answer_text, sources=_build_sources(top_chunks), chunks=top_chunks,
+                session_id=session_id, is_grounded=True, scope_type=scope.scope_type,
+            ))
+            return
+        log.info("No chapter summaries available — falling back to GENERAL")
+
+    elif intent == QueryIntent.TOPIC_IN_CHAPTER:
+        yield StreamUpdate("progress", f"Searching within chapter {chapter_num}...")
+        top_chunks = _chapter_scoped_chunks(
+            question, chapter_num, scope.book_ids, db, top_k=_settings.retrieval_top_k
+        )
+        if top_chunks:
+            yield StreamUpdate("progress", "Reranking results...")
+            top_chunks = rerank(question, top_chunks, top_k=_settings.rerank_top_k)
+            yield StreamUpdate("progress", "Generating answer...")
+            answer_parts = []
+            for chunk in generate_answer_stream(question, top_chunks, history, low_confidence=False):
+                answer_parts.append(chunk)
+                yield StreamUpdate("chunk", chunk)
+            answer_text = "".join(answer_parts)
+            _persist(question, answer_text, session_id, db,
+                     list({c.book_id for c in top_chunks}), [c.child_id for c in top_chunks])
+            cache_mgr.set_answer(question, scope.book_ids, answer_text, top_chunks,
+                                 "topic_in_chapter", (time.time() - start_time) * 1000)
+            yield StreamUpdate("complete", AgentResponse(
+                answer=answer_text, sources=_build_sources(top_chunks), chunks=top_chunks,
+                session_id=session_id, is_grounded=True, scope_type=scope.scope_type,
+            ))
+            return
+        log.info("No chapter-scoped results — falling back to GENERAL")
+
+    # GENERAL (or any fallback): continue to query rewriting + vector search
     # ── 3. Rewrite queries ────────────────────────────────────────────────────
     if _is_simple_query(question):
         queries = [question]

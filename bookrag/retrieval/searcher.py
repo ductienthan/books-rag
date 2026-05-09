@@ -207,6 +207,7 @@ def _vector_search(
     book_ids: list[str],
     db: Session,
     top_k: int,
+    chapter_ids: list[str] | None = None,
 ) -> list[tuple[str, float]]:
     """
     Run vector search and return (parent_id, score) tuples.
@@ -216,13 +217,15 @@ def _vector_search(
         book_ids: List of book IDs to search
         db: Database session
         top_k: Number of results to retrieve
+        chapter_ids: Optional list of chapter IDs to restrict the search to
 
     Returns:
         List of (parent_id, score) tuples sorted by score descending
     """
     query_vec = embed_query(query)
 
-    sql = text("""
+    chapter_filter = "AND cc.chapter_id = ANY(:chapter_ids)" if chapter_ids else ""
+    sql = text(f"""
         SELECT
             cc.parent_chunk_id,
             1 - (cc.embedding <=> CAST(:vec AS vector)) AS score
@@ -232,15 +235,20 @@ def _vector_search(
             cc.book_id = ANY(:book_ids)
             AND cc.embedding IS NOT NULL
             AND ch.chapter_type NOT IN ('front_matter', 'back_matter')
+            {chapter_filter}
         ORDER BY cc.embedding <=> CAST(:vec AS vector)
         LIMIT :k
     """)
 
-    rows = db.execute(sql, {
+    params: dict = {
         "vec": str(query_vec),
         "book_ids": book_ids,
         "k": top_k,
-    }).fetchall()
+    }
+    if chapter_ids:
+        params["chapter_ids"] = chapter_ids
+
+    rows = db.execute(sql, params).fetchall()
 
     # Filter by threshold and deduplicate by parent_id (keep highest score)
     seen: dict[str, float] = {}
@@ -264,7 +272,18 @@ def _bm25_search(
     top_k: int,
 ) -> list[tuple[str, float]]:
     """
-    Run BM25 search and return (parent_id, score) tuples.
+    Run BM25 search with Pseudo-Relevance Feedback (PRF) query expansion.
+
+    Two-pass strategy:
+      1. Initial BM25 pass with the original query tokens.
+      2. Extract distinctive terms from the top-3 results (words that appear
+         frequently in those chunks but are uncommon across the index).
+      3. Append the top expansion terms to the query and run a second BM25 pass.
+      4. Merge both result lists, preferring second-pass scores when a parent_id
+         appears in both.
+
+    PRF is book-agnostic: expansion terms come from the indexed book's own
+    vocabulary, so it works for any domain without a manual synonym map.
 
     Args:
         query: Search query
@@ -275,19 +294,63 @@ def _bm25_search(
     Returns:
         List of (parent_id, score) tuples sorted by score descending
     """
-    # Lazy import to avoid circular dependency
-    from bookrag.retrieval.bm25 import BM25IndexManager
+    from collections import Counter
+    from bookrag.retrieval.bm25 import BM25IndexManager, simple_tokenize
 
     try:
         index_dir = Path(_settings.bm25_index_dir)
         manager = BM25IndexManager(index_dir=index_dir)
 
-        # Search returns (chunk_id, bm25_score) tuples
-        # chunk_id is the parent_chunk_id in BM25Index
-        results = manager.search(book_ids, query, db, top_k=top_k)
+        # ── Pass 1: initial search ────────────────────────────────────────────
+        initial_results = manager.search(book_ids, query, db, top_k=top_k)
+        log.debug(f"BM25 pass-1 returned {len(initial_results)} results")
 
-        log.debug(f"BM25 search returned {len(results)} results")
-        return results
+        if not initial_results:
+            return []
+
+        # ── PRF: extract expansion terms from top-3 chunks ───────────────────
+        prf_top_n = 3
+        expansion_terms: list[str] = []
+
+        top_parent_ids = [pid for pid, _ in initial_results[:prf_top_n]]
+        feedback_tokens: list[str] = []
+
+        for parent_id in top_parent_ids:
+            parent = db.query(ParentChunk).filter(ParentChunk.id == parent_id).one_or_none()
+            if parent:
+                feedback_tokens.extend(simple_tokenize(parent.text))
+
+        if feedback_tokens:
+            # Count term frequencies in feedback documents
+            tf = Counter(feedback_tokens)
+
+            # Remove terms already in the query
+            query_tokens_set = set(simple_tokenize(query))
+
+            # Pick the top expansion terms not already in the query
+            # (limit to 5 terms to avoid query drift)
+            expansion_terms = [
+                term for term, _ in tf.most_common(20)
+                if term not in query_tokens_set and len(term) > 2
+            ][:5]
+
+        if expansion_terms:
+            expanded_query = query + " " + " ".join(expansion_terms)
+            log.debug(f"PRF expansion terms: {expansion_terms}")
+
+            # ── Pass 2: expanded query ────────────────────────────────────────
+            expanded_results = manager.search(book_ids, expanded_query, db, top_k=top_k)
+            log.debug(f"BM25 pass-2 returned {len(expanded_results)} results")
+
+            # Merge: second-pass scores take precedence (expanded query is richer)
+            merged: dict[str, float] = dict(initial_results)
+            for parent_id, score in expanded_results:
+                if parent_id not in merged or score > merged[parent_id]:
+                    merged[parent_id] = score
+
+            return sorted(merged.items(), key=lambda x: x[1], reverse=True)[:top_k]
+
+        return initial_results
 
     except Exception as e:
         log.warning(f"BM25 search failed: {e}")
@@ -420,3 +483,60 @@ def search_chapter_summaries(
     rows = db.execute(sql, {"vec": str(query_vec), "book_ids": book_ids, "k": top_k}).fetchall()
     ids = [r.id for r in rows if float(r.score) >= _settings.cosine_threshold]
     return db.query(ChapterSummary).filter(ChapterSummary.id.in_(ids)).all() if ids else []
+
+
+def search_within_chapter(
+    queries: list[str],
+    chapter_ids: list[str],
+    book_ids: list[str],
+    db: Session,
+    top_k: int = 10,
+) -> list[RetrievedChunk]:
+    """Vector-search restricted to specific chapters (used for TOPIC_IN_CHAPTER intent).
+
+    Mirrors the logic of search() but passes chapter_ids as an additional filter
+    to _vector_search(), so only child chunks from the target chapter are scored.
+    BM25 is intentionally skipped here — chapter scope provides sufficient focus.
+    """
+    if not chapter_ids or not book_ids:
+        return []
+
+    books = {b.id: b for b in db.query(Book).filter(Book.id.in_(book_ids)).all()}
+    all_parent_ids: dict[str, float] = {}
+
+    for query in queries:
+        vector_results = _vector_search(query, book_ids, db, top_k=top_k, chapter_ids=chapter_ids)
+        for parent_id, score in vector_results:
+            if parent_id not in all_parent_ids or score > all_parent_ids[parent_id]:
+                all_parent_ids[parent_id] = score
+
+    sorted_parents = sorted(all_parent_ids.items(), key=lambda x: x[1], reverse=True)[:top_k]
+
+    results: list[RetrievedChunk] = []
+    for parent_id, score in sorted_parents:
+        parent = db.query(ParentChunk).filter(ParentChunk.id == parent_id).one_or_none()
+        if not parent:
+            continue
+        chapter = db.query(Chapter).filter(Chapter.id == parent.chapter_id).one_or_none()
+        book = books.get(parent.book_id)
+        if not chapter or not book:
+            continue
+        child = db.query(ChildChunk).filter(ChildChunk.parent_chunk_id == parent_id).first()
+        if not child:
+            continue
+        results.append(RetrievedChunk(
+            child_id=child.id,
+            parent_id=parent_id,
+            book_id=parent.book_id,
+            book_title=book.title,
+            chapter_index=chapter.chapter_index,
+            chapter_title=chapter.title,
+            page_start=parent.page_start,
+            page_end=parent.page_end,
+            child_text=child.text,
+            parent_text=parent.text,
+            score=score,
+        ))
+
+    log.info("search_within_chapter: %d results from chapter_ids=%s", len(results), chapter_ids)
+    return results

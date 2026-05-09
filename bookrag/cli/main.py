@@ -14,8 +14,22 @@ Commands:
   bookrag clear-cache              Clear query result cache
   bookrag build-bm25-index         Build BM25 keyword search indexes
   bookrag rebuild-bm25-index       Rebuild all BM25 indexes
+  bookrag debug-retrieve '<q>'     Inspect retrieved chunks without generating an answer
+  bookrag serve                    Start the FastAPI HTTP server
+  bookrag eval                     Run retrieval evaluation on eval_questions.json
 """
 from __future__ import annotations
+from rich.text import Text
+from rich.table import Table
+from rich.prompt import Confirm, Prompt
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn
+from rich.panel import Panel
+from rich.markdown import Markdown
+from rich.live import Live
+from rich.console import Console
+from rich import print as rprint
+import typer
+from sqlalchemy import text
 
 import json
 import os
@@ -27,17 +41,6 @@ from typing import Optional
 from dotenv import load_dotenv
 load_dotenv()
 
-from sqlalchemy import text
-import typer
-from rich import print as rprint
-from rich.console import Console
-from rich.live import Live
-from rich.markdown import Markdown
-from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn, TimeElapsedColumn
-from rich.prompt import Confirm, Prompt
-from rich.table import Table
-from rich.text import Text
 
 app = typer.Typer(
     name="bookrag",
@@ -202,7 +205,8 @@ def add(
   # Compute file hash
   sha256 = hashlib.sha256(file.read_bytes()).hexdigest()
 
-  import sys, traceback as _tb
+  import sys
+  import traceback as _tb
   _reset_db_pool()  # clear any stale idle-in-transaction connections from previous runs
   try:
     with _get_db() as db:
@@ -218,7 +222,8 @@ def add(
         should_reingest = force or existing.status in _INCOMPLETE
         if should_reingest:
           if existing.status == "completed":
-            rprint(f"[yellow]Re-ingesting '[bold]{existing.title}[/bold]' (--force)…[/yellow]")
+            rprint(
+                f"[yellow]Re-ingesting '[bold]{existing.title}[/bold]' (--force)…[/yellow]")
           else:
             rprint(f"[yellow]Re-ingesting '[bold]{existing.title}[/bold]' "
                    f"(previous run was interrupted at status='{existing.status}')…[/yellow]")
@@ -235,32 +240,43 @@ def add(
               .all()
           )
           for s in stale_sessions:
-              db.query(Message).filter(Message.session_id == s.id).delete(synchronize_session=False)
-              db.delete(s)
+            db.query(Message).filter(Message.session_id ==
+                                     s.id).delete(synchronize_session=False)
+            db.delete(s)
           try:
-            db.query(ChapterSummary).filter(ChapterSummary.book_id == book_id).delete(synchronize_session=False)
-            db.query(ChildChunk).filter(ChildChunk.book_id == book_id).delete(synchronize_session=False)
-            db.query(ParentChunk).filter(ParentChunk.book_id == book_id).delete(synchronize_session=False)
-            db.query(Chapter).filter(Chapter.book_id == book_id).delete(synchronize_session=False)
-            db.query(IngestionJob).filter(IngestionJob.book_id == book_id).delete(synchronize_session=False)
-            db.query(Book).filter(Book.id == book_id).delete(synchronize_session=False)
+            db.query(ChapterSummary).filter(ChapterSummary.book_id ==
+                                            book_id).delete(synchronize_session=False)
+            db.query(ChildChunk).filter(ChildChunk.book_id ==
+                                        book_id).delete(synchronize_session=False)
+            db.query(ParentChunk).filter(ParentChunk.book_id ==
+                                         book_id).delete(synchronize_session=False)
+            db.query(Chapter).filter(Chapter.book_id ==
+                                     book_id).delete(synchronize_session=False)
+            db.query(IngestionJob).filter(IngestionJob.book_id ==
+                                          book_id).delete(synchronize_session=False)
+            db.query(Book).filter(Book.id == book_id).delete(
+                synchronize_session=False)
             db.flush()
           except Exception as exc:
             if "lock_timeout" in str(exc).lower() or "LockNotAvailable" in type(exc).__name__:
-              rprint("[red]✗ Cannot delete old data:[/red] the worker is still processing this book.")
-              rprint("[dim]Wait for the worker to finish (or stop it), then re-run with --force.[/dim]")
+              rprint(
+                  "[red]✗ Cannot delete old data:[/red] the worker is still processing this book.")
+              rprint(
+                  "[dim]Wait for the worker to finish (or stop it), then re-run with --force.[/dim]")
               raise typer.Exit(1)
             raise
           if _SESSION_FILE.exists():
             _SESSION_FILE.unlink()
         else:
-          rprint(f"[yellow]Book already ingested:[/yellow] '{existing.title}' (id: {existing.id[:8]}…)")
+          rprint(
+              f"[yellow]Book already ingested:[/yellow] '{existing.title}' (id: {existing.id[:8]}…)")
           rprint("[dim]Use --force to re-ingest.[/dim]")
           raise typer.Exit(0)
       else:
         count = db.query(Book).count()
         if count >= cfg.max_books:
-          rprint(f"[red]Book limit reached:[/red] maximum {cfg.max_books} books allowed.")
+          rprint(
+              f"[red]Book limit reached:[/red] maximum {cfg.max_books} books allowed.")
           raise typer.Exit(1)
 
       print("DEBUG: detecting metadata...", flush=True)
@@ -291,7 +307,8 @@ def add(
 
       # When running locally, claim the job immediately so the Docker worker
       # doesn't race to pick it up between commit and process_job() starting.
-      job = IngestionJob(book_id=book.id, status="processing" if local else "queued")
+      job = IngestionJob(
+          book_id=book.id, status="processing" if local else "queued")
       db.add(job)
       db.flush()
       print(f"DEBUG: job created id={job.id}", flush=True)
@@ -308,7 +325,8 @@ def add(
     raise typer.Exit(1)
 
   if local:
-    rprint(f"[green]✓[/green] Ingesting [bold]{detected_title}[/bold] locally…")
+    rprint(
+        f"[green]✓[/green] Ingesting [bold]{detected_title}[/bold] locally…")
     _run_ingestion_local(job_id)
   else:
     rprint(f"[green]✓[/green] Queued [bold]{detected_title}[/bold]")
@@ -326,18 +344,18 @@ def _run_ingestion_local(job_id: str) -> None:
   """Run the full ingestion pipeline in the current process (no Docker worker needed)."""
   from bookrag.ingestion.worker import process_job
   try:
-      process_job(job_id)
+    process_job(job_id)
   except Exception as exc:
-      rprint(f"[red]✗ Ingestion failed:[/red] {exc}")
-      raise typer.Exit(1)
+    rprint(f"[red]✗ Ingestion failed:[/red] {exc}")
+    raise typer.Exit(1)
 
   # Check DB to confirm success (process_job swallows exceptions internally)
   from bookrag.db.models import IngestionJob
   with _get_db() as db:
-      job = db.query(IngestionJob).filter(IngestionJob.id == job_id).one()
-      if job.status == "failed":
-          rprint(f"[red]✗ Ingestion failed:[/red] {job.error_msg}")
-          raise typer.Exit(1)
+    job = db.query(IngestionJob).filter(IngestionJob.id == job_id).one()
+    if job.status == "failed":
+      rprint(f"[red]✗ Ingestion failed:[/red] {job.error_msg}")
+      raise typer.Exit(1)
 
   rprint("[green]✓[/green] Ingestion complete.")
 
@@ -509,6 +527,55 @@ def _watch_job(job_id: str) -> None:
       time.sleep(3)
 
 
+# ── book name resolver ────────────────────────────────────────────────────────
+
+def _resolve_book_names_to_ids(books_input: str, db) -> list[str]:
+  """Resolve comma-separated book names to UUIDs via fuzzy matching.
+
+  Always treats input as book titles/names — users never need to know internal IDs.
+  Misspellings are handled with suggestions.
+  """
+  from rapidfuzz import process as rfprocess, fuzz
+  from bookrag.db.models import Book
+
+  all_books = db.query(Book).filter(Book.status == "completed").all()
+  if not all_books:
+    console.print(
+        "[red]No books have been ingested yet. Run 'bookrag add' first.[/red]")
+    raise typer.Exit(1)
+
+  title_to_book: dict[str, Book] = {b.title: b for b in all_books}
+  for b in all_books:
+    if b.author:
+      title_to_book.setdefault(b.author, b)
+
+  resolved: list[str] = []
+  for raw in books_input.split(","):
+    entry = raw.strip()
+    if not entry:
+      continue
+    result = rfprocess.extractOne(
+        entry, title_to_book.keys(), scorer=fuzz.partial_ratio)
+    if result and result[1] >= 60:
+      book = title_to_book[result[0]]
+      if result[0].lower() != entry.lower():
+        console.print(
+            f'[cyan]Scoped to: "{result[0]}" (matched "{entry}", {result[1]:.0f}%)[/cyan]'
+        )
+      resolved.append(book.id)
+    elif result and result[1] >= 40:
+      console.print(
+          f'[red]No book matched "{entry}". Did you mean: "{result[0]}" ({result[1]:.0f}%)?[/red]'
+      )
+      raise typer.Exit(1)
+    else:
+      available = ", ".join(f'"{b.title}"' for b in all_books)
+      console.print(
+          f'[red]No book matched "{entry}". Available books: {available}[/red]')
+      raise typer.Exit(1)
+  return resolved
+
+
 # ── ask ───────────────────────────────────────────────────────────────────────
 
 @app.command()
@@ -518,7 +585,10 @@ def ask(
     session_id: Optional[str] = typer.Option(
         None, "--session", "-s", help="Session ID to use"),
     books: Optional[str] = typer.Option(
-        None, "--books", "-b", help="Comma-separated book IDs to scope to"),
+        None, "--books", "-b",
+        help="Comma-separated book names to scope to (partial/misspelled names accepted)"),
+    debug: bool = typer.Option(
+        False, "--debug", help="Print retrieved chunks before the answer"),
 ):
   """Ask a question against your ingested books."""
   from bookrag.db.models import Book, Session as DBSession
@@ -533,24 +603,26 @@ def ask(
       sid = s.id
       _set_session_id(sid)
 
-    # Apply book scope if specified
+    # Apply book scope if specified; clear any lingering scope when omitted
     if books:
-      book_id_list = [b.strip() for b in books.split(",")]
+      book_id_list = _resolve_book_names_to_ids(books, db)
       set_session_scope(sid, book_id_list, db)
+    else:
+      set_session_scope(sid, [], db)
 
   if question:
     # Check if streaming is enabled
     from bookrag.config import get_settings
     settings = get_settings()
     if settings.enable_streaming:
-      _run_query_stream(question, sid)
+      _run_query_stream(question, sid, debug=debug)
     else:
-      _run_query(question, sid)
+      _run_query(question, sid, debug=debug)
   else:
     _interactive_loop(sid)
 
 
-def _run_query_stream(question: str, session_id: str) -> None:
+def _run_query_stream(question: str, session_id: str, debug: bool = False) -> None:
   """Run query with streaming display (Phase 3.3)."""
   import time
   from rich.live import Live
@@ -598,6 +670,11 @@ def _run_query_stream(question: str, session_id: str) -> None:
   if not final_response:
     console.print("[red]Error: No response received[/red]")
     return
+
+  # Debug: print raw retrieved chunks before the answer
+  if debug and final_response.chunks:
+    console.print(f"\n[bold yellow]── Debug: {len(final_response.chunks)} retrieved chunk(s) ──[/bold yellow]\n")
+    _print_debug_chunks(final_response.chunks)
 
   # Now display final formatted output (same as non-streaming)
   warning = "" if final_response.is_grounded else "\n⚠️  [dim]Low confidence — answer may not be fully supported by the books.[/dim]"
@@ -649,7 +726,7 @@ def _run_query_stream(question: str, session_id: str) -> None:
   console.print(f"[dim]Answered in {elapsed:.1f}s[/dim]")
 
 
-def _run_query(question: str, session_id: str) -> None:
+def _run_query(question: str, session_id: str, debug: bool = False) -> None:
   import time
   from bookrag.agent.loop import ask as agent_ask
 
@@ -658,6 +735,11 @@ def _run_query(question: str, session_id: str) -> None:
     with _get_db() as db:
       response = agent_ask(question, session_id, db)
   elapsed = time.monotonic() - start
+
+  # Debug: print raw retrieved chunks before the answer
+  if debug and response.chunks:
+    console.print(f"\n[bold yellow]── Debug: {len(response.chunks)} retrieved chunk(s) ──[/bold yellow]\n")
+    _print_debug_chunks(response.chunks)
 
   # Answer panel
   warning = "" if response.is_grounded else "\n⚠️  [dim]Low confidence — answer may not be fully supported by the books.[/dim]"
@@ -732,6 +814,57 @@ def _interactive_loop(session_id: str) -> None:
 
     _run_query(question.strip(), session_id)
     console.print()
+
+
+# ── debug_retrieve ────────────────────────────────────────────────────────────
+
+def _print_debug_chunks(chunks: list, show_parent: bool = False) -> None:
+  """Print retrieved chunks in a human-readable debug format."""
+  if not chunks:
+    console.print("[yellow]No chunks retrieved.[/yellow]")
+    return
+  for i, chunk in enumerate(chunks, 1):
+    console.rule(f"Chunk {i} | score: {chunk.score:.4f}")
+    page_range = ""
+    if chunk.page_start and chunk.page_end:
+      page_range = f" | Pages: {chunk.page_start}–{chunk.page_end}"
+    elif chunk.page_start:
+      page_range = f" | Page: {chunk.page_start}"
+    chapter_info = f"Ch {chunk.chapter_index}"
+    if chunk.chapter_title:
+      chapter_info += f": {chunk.chapter_title}"
+    console.print(
+        f"[dim]Book: {chunk.book_title} | {chapter_info}{page_range}[/dim]"
+    )
+    console.print(chunk.child_text)
+    if show_parent:
+      console.print("\n[dim italic]--- Parent context ---[/dim italic]")
+      console.print(chunk.parent_text)
+    console.print()
+
+
+@app.command()
+def debug_retrieve(
+    query: str = typer.Argument(..., help="Query to retrieve chunks for"),
+    top_k: int = typer.Option(10, "--top-k", "-k", help="Number of chunks to retrieve"),
+    book_id: Optional[str] = typer.Option(None, "--book-id", help="Limit to a specific book ID"),
+    show_parent: bool = typer.Option(False, "--show-parent", help="Also print parent context window"),
+):
+  """Inspect retrieved chunks for a query without generating an answer."""
+  from bookrag.retrieval.searcher import search
+
+  book_ids = [book_id] if book_id else []
+
+  console.print(f"[bold cyan]Retrieving top {top_k} chunks for:[/bold cyan] {query}")
+  if book_ids:
+    console.print(f"[dim]Scoped to book: {book_id}[/dim]")
+  console.print()
+
+  with _get_db() as db:
+    results = search([query], book_ids, db, top_k=top_k)
+
+  console.print(f"[bold]Found {len(results)} chunk(s)[/bold]\n")
+  _print_debug_chunks(results, show_parent=show_parent)
 
 
 # ── session ───────────────────────────────────────────────────────────────────
@@ -833,24 +966,32 @@ def cache_stats():
   stats = cache_mgr.stats()
 
   # Overall stats table
-  table = Table(title="Cache Overview", show_header=True, header_style="bold cyan")
+  table = Table(title="Cache Overview", show_header=True,
+                header_style="bold cyan")
   table.add_column("Metric", style="dim")
   table.add_column("Value", justify="right")
 
   if "embedding_cache" in stats:
-    table.add_row("Embedding Cache Entries", str(stats["embedding_cache"]["count"]))
-    table.add_row("Embedding Cache Size", f"{stats['embedding_cache']['size_mb']:.2f} MB")
+    table.add_row("Embedding Cache Entries", str(
+        stats["embedding_cache"]["count"]))
+    table.add_row("Embedding Cache Size",
+                  f"{stats['embedding_cache']['size_mb']:.2f} MB")
 
   if "answer_cache" in stats:
     answer_stats = stats["answer_cache"]
-    table.add_row("Answer Cache Entries (Total)", str(answer_stats["total_entries"]))
-    table.add_row("Answer Cache Entries (Valid)", f"[green]{answer_stats['valid_entries']}[/green]")
-    table.add_row("Answer Cache Entries (Expired)", f"[yellow]{answer_stats['expired_entries']}[/yellow]")
+    table.add_row("Answer Cache Entries (Total)",
+                  str(answer_stats["total_entries"]))
+    table.add_row("Answer Cache Entries (Valid)",
+                  f"[green]{answer_stats['valid_entries']}[/green]")
+    table.add_row("Answer Cache Entries (Expired)",
+                  f"[yellow]{answer_stats['expired_entries']}[/yellow]")
     table.add_row("Answer Cache Size", f"{answer_stats['size_mb']:.2f} MB")
-    table.add_row("Answer Cache TTL", f"{answer_stats['ttl_seconds']}s ({answer_stats['ttl_seconds']//60}min)")
+    table.add_row("Answer Cache TTL",
+                  f"{answer_stats['ttl_seconds']}s ({answer_stats['ttl_seconds']//60}min)")
 
   table.add_row("──────────", "──────────")
-  table.add_row("[bold]Total Cache Size[/bold]", f"[bold]{stats['total_size_mb']:.2f} MB[/bold]")
+  table.add_row("[bold]Total Cache Size[/bold]",
+                f"[bold]{stats['total_size_mb']:.2f} MB[/bold]")
 
   console.print(table)
 
@@ -864,7 +1005,8 @@ def cache_stats():
   # Performance estimates
   if "answer_cache" in stats and stats["answer_cache"]["valid_entries"] > 0:
     avg_time_saved = 120  # seconds (average query time without cache)
-    total_hits_estimated = stats["answer_cache"]["valid_entries"] * 2  # assume 2 uses per cache entry
+    # assume 2 uses per cache entry
+    total_hits_estimated = stats["answer_cache"]["valid_entries"] * 2
     time_saved_total = avg_time_saved * total_hits_estimated / 60  # minutes
 
     console.print(
@@ -972,7 +1114,8 @@ def build_bm25_index(
       task = progress.add_task("[cyan]Building indexes...", total=len(books))
 
       for book in books:
-        progress.update(task, description=f"[cyan]Building: {book.title[:40]}...")
+        progress.update(
+            task, description=f"[cyan]Building: {book.title[:40]}...")
 
         try:
           index = manager.build_index([book.id], db, force=force)
@@ -1032,6 +1175,214 @@ def rebuild_bm25_index(
     except Exception as e:
       rprint(f"[red]Error:[/red] {e}")
       raise typer.Exit(1)
+
+
+# ── HTTP API Server ───────────────────────────────────────────────────────────
+
+@app.command(name="serve")
+def serve(
+    host: str = typer.Option("0.0.0.0", "--host", "-H", help="Bind address"),
+    port: int = typer.Option(8080, "--port", "-p", help="Port number"),
+    reload: bool = typer.Option(False, "--reload", help="Auto-reload on code changes (dev only)"),
+    workers: int = typer.Option(1, "--workers", "-w", help="Number of Uvicorn worker processes"),
+):
+  """Start the BookRAG FastAPI HTTP server.
+
+  The server exposes:
+    GET  /health   — liveness check (DB + BM25 index status)
+    GET  /books    — list all ingested books
+    POST /ask      — answer a question from the ingested books
+
+  Example:
+    bookrag serve --port 8080
+    curl http://localhost:8080/health
+    curl -X POST http://localhost:8080/ask \\
+         -H 'Content-Type: application/json' \\
+         -d '{"question": "What is motivational interviewing?"}'
+  """
+  try:
+    import uvicorn
+  except ImportError:
+    rprint("[red]Error:[/red] uvicorn is not installed.")
+    rprint("[dim]Run: pip install 'uvicorn[standard]'[/dim]")
+    raise typer.Exit(1)
+
+  console.rule(f"[bold cyan]BookRAG API Server[/bold cyan]")
+  rprint(f"  [dim]Host:[/dim]    {host}")
+  rprint(f"  [dim]Port:[/dim]    {port}")
+  rprint(f"  [dim]Workers:[/dim] {workers}")
+  rprint(f"  [dim]Docs:[/dim]    http://{host if host != '0.0.0.0' else 'localhost'}:{port}/docs\n")
+
+  uvicorn.run(
+    "bookrag.api.server:app",
+    host=host,
+    port=port,
+    reload=reload,
+    workers=workers if not reload else 1,
+    log_level="info",
+  )
+
+
+# ── Retrieval Evaluation ──────────────────────────────────────────────────────
+
+@app.command(name="eval")
+def eval_retrieval(
+    questions_file: Path = typer.Option(
+        Path("eval_questions.json"),
+        "--questions", "-q",
+        help="Path to JSON file with evaluation questions",
+        exists=True,
+    ),
+    book_id: Optional[str] = typer.Option(
+        None, "--book", "-b", help="Book ID (prefix) to evaluate against. Defaults to all books."),
+    top_k: int = typer.Option(10, "--top-k", "-k", help="Number of chunks to retrieve per query"),
+    output: Optional[Path] = typer.Option(
+        None, "--output", "-o", help="Save results JSON to this path"),
+):
+  """Run retrieval evaluation against eval_questions.json.
+
+  Measures how well the hybrid retriever surfaces relevant chunks for each
+  question using keyword-coverage as a proxy relevance signal.
+
+  Metrics reported:
+    • Keyword Coverage   — fraction of question keywords found in top-K chunks
+    • Keyword Hit Rate   — fraction of questions where ≥1 keyword is covered
+    • Avg chunks returned
+
+  Example:
+    bookrag eval --questions eval_questions.json --book bb1c7eb5 --top-k 10
+  """
+  import json
+  from bookrag.config import get_settings
+  from bookrag.db.models import Book
+  from bookrag.retrieval.searcher import search as retrieval_search
+
+  settings = get_settings()
+
+  console.rule("[bold cyan]BookRAG Retrieval Evaluation[/bold cyan]")
+  rprint(f"  [dim]Questions:[/dim] {questions_file}")
+  rprint(f"  [dim]Top-K:[/dim]    {top_k}\n")
+
+  # Load questions
+  try:
+    with open(questions_file) as f:
+      questions = json.load(f)
+  except Exception as e:
+    rprint(f"[red]Error loading questions:[/red] {e}")
+    raise typer.Exit(1)
+
+  with _get_db() as db:
+    # Resolve books
+    if book_id:
+      book = db.query(Book).filter(Book.id.like(f"{book_id}%")).first()
+      if not book:
+        rprint(f"[red]Book not found:[/red] {book_id}")
+        raise typer.Exit(1)
+      book_ids = [book.id]
+      rprint(f"  [dim]Book:[/dim]     {book.title}\n")
+    else:
+      books = db.query(Book).filter(Book.status == "ready").all()
+      book_ids = [b.id for b in books]
+      rprint(f"  [dim]Books:[/dim]    {len(book_ids)} ready book(s)\n")
+
+    if not book_ids:
+      rprint("[yellow]No ready books found.[/yellow]")
+      raise typer.Exit(1)
+
+    # Run evaluation
+    total = len(questions)
+    keyword_coverages: list[float] = []
+    hit_count = 0
+    results_log: list[dict] = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+      task = progress.add_task(f"[cyan]Evaluating {total} questions...", total=total)
+
+      for q in questions:
+        qid = q.get("id", "?")
+        question = q.get("question", "")
+        keywords = [kw.lower() for kw in q.get("keywords", [])]
+
+        try:
+          chunks = retrieval_search([question], book_ids, db, top_k=top_k)
+        except Exception as e:
+          log_entry = {"id": qid, "question": question, "error": str(e), "coverage": 0.0}
+          results_log.append(log_entry)
+          keyword_coverages.append(0.0)
+          progress.advance(task)
+          continue
+
+        # Compute keyword coverage: what fraction of keywords appear in top-K
+        combined_text = " ".join(c.parent_text.lower() for c in chunks)
+        if keywords:
+          covered = sum(1 for kw in keywords if kw in combined_text)
+          coverage = covered / len(keywords)
+        else:
+          coverage = 1.0
+
+        keyword_coverages.append(coverage)
+        if coverage > 0:
+          hit_count += 1
+
+        results_log.append({
+          "id": qid,
+          "category": q.get("category", ""),
+          "question": question,
+          "keywords": keywords,
+          "chunks_returned": len(chunks),
+          "keyword_coverage": round(coverage, 3),
+        })
+
+        progress.advance(task)
+
+  # ── Summary ───────────────────────────────────────────────────────────────
+  avg_coverage = sum(keyword_coverages) / len(keyword_coverages) if keyword_coverages else 0
+  hit_rate = hit_count / total if total else 0
+  avg_chunks = sum(r.get("chunks_returned", 0) for r in results_log) / total if total else 0
+
+  console.rule("[bold green]Results[/bold green]")
+
+  table = Table(show_header=True, header_style="bold cyan")
+  table.add_column("Metric", style="dim", width=28)
+  table.add_column("Value", justify="right")
+  table.add_row("Questions evaluated", str(total))
+  table.add_row("Avg keyword coverage", f"{avg_coverage:.1%}")
+  table.add_row("Keyword hit rate", f"{hit_rate:.1%}")
+  table.add_row("Avg chunks returned", f"{avg_chunks:.1f}")
+  console.print(table)
+
+  # Grade
+  if avg_coverage >= 0.75:
+    grade = "[green]GOOD[/green]"
+  elif avg_coverage >= 0.50:
+    grade = "[yellow]NEEDS IMPROVEMENT[/yellow]"
+  else:
+    grade = "[red]POOR[/red]"
+
+  rprint(f"\nRetrieval quality: {grade}")
+  rprint(f"[dim](Keyword coverage ≥ 75% = GOOD, 50–74% = NEEDS IMPROVEMENT, <50% = POOR)[/dim]\n")
+
+  # Save results if requested
+  if output:
+    summary = {
+      "total_questions": total,
+      "avg_keyword_coverage": round(avg_coverage, 4),
+      "keyword_hit_rate": round(hit_rate, 4),
+      "avg_chunks_returned": round(avg_chunks, 2),
+      "top_k": top_k,
+      "book_ids": book_ids,
+      "results": results_log,
+    }
+    with open(output, "w") as f:
+      json.dump(summary, f, indent=2)
+    rprint(f"[green]✓[/green] Results saved to {output}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

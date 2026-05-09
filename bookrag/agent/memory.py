@@ -67,7 +67,7 @@ def create_session(db: DBSession, book_ids: list[str] | None = None) -> Session:
 
 
 def set_session_scope(session_id: str, book_ids: list[str], db: DBSession) -> None:
-    """Update the book scope for an existing session."""
+    """Update the book scope for an existing session. Pass empty list to clear scope."""
     session = db.query(Session).filter(Session.id == session_id).one()
-    session.book_scope = json.dumps(book_ids)
+    session.book_scope = json.dumps(book_ids) if book_ids else None
     db.flush()

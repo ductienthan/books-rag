@@ -31,34 +31,50 @@ import numpy as np
 from rank_bm25 import BM25Okapi
 from sqlalchemy.orm import Session as DBSession
 
-from bookrag.db.models import ParentChunk
+from bookrag.db.models import ChildChunk, ParentChunk
 
 log = logging.getLogger(__name__)
 
 
 def simple_tokenize(text: str) -> list[str]:
     """
-    Simple tokenization for BM25.
+    Tokenization for BM25.
 
-    - Lowercase
-    - Remove special characters
+    - Preserves ALL-CAPS tokens (2+ chars) before lowercasing so that
+      acronyms are indexed as both their uppercase and lowercase forms
+      without duplication.  Example: "The WHO and UN agreed" →
+      tokens include 'who' and 'un' alongside the regular lowercase tokens.
+    - Lowercase everything
+    - Remove special characters (keep alphanumeric and hyphens)
     - Split on whitespace
-    - Keep alphanumeric tokens
+    - Keep tokens of length > 1
+
+    This is fully book-agnostic: any ALL-CAPS abbreviation in any book is
+    handled automatically via regex — no domain-specific word lists needed.
 
     Args:
         text: Input text to tokenize
 
     Returns:
-        List of tokens
+        List of tokens (acronyms appear once as lowercase)
     """
-    # Lowercase
-    text = text.lower()
+    # Extract ALL-CAPS tokens (2+ chars) before lowercasing
+    acronyms = re.findall(r'\b[A-Z]{2,}\b', text)
 
-    # Replace punctuation with spaces (keep alphanumeric and hyphens)
+    # Lowercase and strip punctuation
+    text = text.lower()
     text = re.sub(r'[^a-z0-9\s\-]', ' ', text)
 
-    # Split and filter empty tokens
+    # Split and filter short/empty tokens
     tokens = [t for t in text.split() if t and len(t) > 1]
+
+    # Re-inject acronyms as lowercase; set() deduplicates against existing tokens
+    existing = set(tokens)
+    for a in acronyms:
+        lc = a.lower()
+        if lc not in existing:
+            tokens.append(lc)
+            existing.add(lc)
 
     return tokens
 
@@ -77,7 +93,7 @@ class BM25Index:
 
         # Load and search
         index = BM25Index.load(Path(".indexes/bm25/book_123.pkl"))
-        results = index.search("OARS model", top_k=20)
+        results = index.search("some query", top_k=20)
     """
 
     def __init__(self):
@@ -93,7 +109,12 @@ class BM25Index:
         progress_callback: Optional[callable] = None
     ) -> 'BM25Index':
         """
-        Build BM25 index from parent chunks.
+        Build BM25 index from child chunks (storing parent_chunk_id).
+
+        Indexing child chunks (80-120 tokens) instead of parent chunks gives
+        the BM25 scorer higher precision — each scored unit is smaller and more
+        focused — while chunk_ids still stores the *parent* chunk ID so that
+        results are directly compatible with RRF fusion against vector search.
 
         Args:
             book_ids: List of book IDs to index
@@ -105,22 +126,21 @@ class BM25Index:
         """
         index = cls()
 
-        # Fetch all parent chunks for the books
+        # Fetch all child chunks for the books
         chunks = (
-            db.query(ParentChunk)
-            .filter(ParentChunk.book_id.in_(book_ids))
+            db.query(ChildChunk)
+            .filter(ChildChunk.book_id.in_(book_ids))
             .all()
         )
 
-        log.info(f"Building BM25 index for {len(chunks)} parent chunks from {len(book_ids)} books")
+        log.info(f"Building BM25 index for {len(chunks)} child chunks from {len(book_ids)} books")
 
-        # Tokenize documents
+        # Tokenize documents; store parent_chunk_id so RRF can match vector results
         for i, chunk in enumerate(chunks):
-            # Tokenize parent text
             tokens = simple_tokenize(chunk.text)
 
             index.documents.append(tokens)
-            index.chunk_ids.append(chunk.id)
+            index.chunk_ids.append(chunk.parent_chunk_id)  # RRF-compatible parent ID
 
             if progress_callback and i % 100 == 0:
                 progress_callback(i, len(chunks))
@@ -128,7 +148,7 @@ class BM25Index:
         # Build BM25 index
         if index.documents:
             index.bm25 = BM25Okapi(index.documents)
-            log.info(f"BM25 index built successfully: {len(index.chunk_ids)} chunks indexed")
+            log.info(f"BM25 index built successfully: {len(index.chunk_ids)} child chunks indexed")
         else:
             log.warning("No documents to index")
 
